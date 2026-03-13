@@ -7,9 +7,11 @@ const canvas = document.querySelector("#viewer-canvas");
 const sceneTitle = document.querySelector("#scene-title");
 const rendererLabel = document.querySelector("#renderer-label");
 const statusBadge = document.querySelector("#status-badge");
-const sizeControl = document.querySelector("#size-control");
 const alphaControl = document.querySelector("#alpha-control");
 const autorotateControl = document.querySelector("#autorotate-control");
+
+// Each splat is 16 floats (64 bytes): posOpacity | quat | scalePad | colorPad
+const FLOATS_PER_SPLAT = 16;
 
 const state = {
   scene: null,
@@ -37,9 +39,10 @@ const state = {
     eye: new Float32Array(3),
     forward: new Float32Array(3),
     viewProjection: new Float32Array(16),
+    view: new Float32Array(16),
+    focal: 0,
   },
   renderOptions: {
-    pointScale: 1.0,
     alphaScale: 1.0,
   },
 };
@@ -156,6 +159,11 @@ function updateCamera(width, height) {
 
   const view = lookAt(new Float32Array(16), state.camera.eye, state.camera.target, state.camera.up);
   multiplyMatrices(state.camera.viewProjection, projection, view);
+
+  // Store view matrix and focal length for the 3DGS covariance shader.
+  // projection[5] = 1/tan(fovY/2), so focal_y = height * 0.5 * projection[5]
+  state.camera.view = view;
+  state.camera.focal = height * 0.5 * projection[5];
 }
 
 function resizeRenderer() {
@@ -179,13 +187,12 @@ function updateSortedSplats(force = false) {
     return;
   }
 
-  const count = state.originalSplats.length / 8;
-  const target = state.camera.target;
+  const count = state.originalSplats.length / FLOATS_PER_SPLAT;
   const eye = state.camera.eye;
   const forward = state.camera.forward;
 
   for (let idx = 0; idx < count; idx += 1) {
-    const base = idx * 8;
+    const base = idx * FLOATS_PER_SPLAT;
     const dx = state.originalSplats[base + 0] - eye[0];
     const dy = state.originalSplats[base + 1] - eye[1];
     const dz = state.originalSplats[base + 2] - eye[2];
@@ -195,9 +202,9 @@ function updateSortedSplats(force = false) {
   state.sortIndices.sort((a, b) => state.depths[b] - state.depths[a]);
 
   for (let writeIndex = 0; writeIndex < count; writeIndex += 1) {
-    const sourceIndex = state.sortIndices[writeIndex] * 8;
-    const destinationIndex = writeIndex * 8;
-    state.sortedSplats.set(state.originalSplats.subarray(sourceIndex, sourceIndex + 8), destinationIndex);
+    const src = state.sortIndices[writeIndex] * FLOATS_PER_SPLAT;
+    const dst = writeIndex * FLOATS_PER_SPLAT;
+    state.sortedSplats.set(state.originalSplats.subarray(src, src + FLOATS_PER_SPLAT), dst);
   }
 
   state.renderer.updateSceneData(state.sortedSplats);
@@ -221,11 +228,6 @@ async function chooseRenderer(scene) {
 }
 
 function bindControls() {
-  sizeControl.addEventListener("input", () => {
-    state.renderOptions.pointScale = Number(sizeControl.value);
-    state.renderer.setRenderOptions(state.renderOptions);
-  });
-
   alphaControl.addEventListener("input", () => {
     state.renderOptions.alphaScale = Number(alphaControl.value);
     state.renderer.setRenderOptions(state.renderOptions);
@@ -285,9 +287,7 @@ function initializeScene(scene) {
   state.camera.pitch = scene.camera.pitch;
   state.camera.distance = scene.camera.distance;
   state.camera.fovY = scene.camera.fovY;
-  state.renderOptions.pointScale = scene.render.pointScale;
   state.renderOptions.alphaScale = scene.render.alphaScale;
-  sizeControl.value = String(scene.render.pointScale);
   alphaControl.value = String(scene.render.alphaScale);
   sceneTitle.textContent = `${scene.title} · ${scene.splatCount.toLocaleString()} splats`;
 }

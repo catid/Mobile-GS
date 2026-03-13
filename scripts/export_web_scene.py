@@ -60,7 +60,8 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--slug", required=True)
     parser.add_argument("--title", required=True)
-    parser.add_argument("--max-splats", type=int, default=20000)
+    parser.add_argument("--max-splats", type=int, default=0,
+                        help="Maximum splats to export (0 = keep all)")
     args = parser.parse_args()
 
     ply = PlyData.read(args.ply)["vertex"]
@@ -83,53 +84,71 @@ def main() -> None:
     )
     rgb = np.clip(sh_dc * C0 + 0.5, 0.0, 1.0)
     opacity = sigmoid(np.asarray(ply["opacity"], dtype=np.float32))
-    scales = np.stack(
-        [np.asarray(ply[f"scale_{idx}"], dtype=np.float32) for idx in range(3)],
+
+    # Quaternion: PLY stores (rot_0=qw, rot_1=qx, rot_2=qy, rot_3=qz)
+    quat_raw = np.stack(
+        [np.asarray(ply[f"rot_{i}"], dtype=np.float32) for i in range(4)],
         axis=1,
     )
-    radius = np.exp(scales).max(axis=1)
+    # Normalize quaternions
+    quat_norms = np.linalg.norm(quat_raw, axis=1, keepdims=True)
+    quat = quat_raw / np.maximum(quat_norms, 1e-8)
 
-    # Cull very weak splats and keep the best contributors for browser delivery.
-    importance = opacity * radius
-    if args.max_splats < len(importance):
+    # Scale: PLY stores log-scale; exponentiate to get positive scales
+    scale = np.exp(np.stack(
+        [np.asarray(ply[f"scale_{i}"], dtype=np.float32) for i in range(3)],
+        axis=1,
+    ))
+
+    # Optional culling by importance (opacity × max-scale)
+    if args.max_splats > 0 and args.max_splats < len(xyz):
+        importance = opacity * scale.max(axis=1)
         keep = np.argpartition(importance, -args.max_splats)[-args.max_splats:]
         keep = keep[np.argsort(importance[keep])[::-1]]
-    else:
-        keep = np.argsort(importance)[::-1]
+        xyz     = xyz[keep]
+        rgb     = rgb[keep]
+        opacity = opacity[keep]
+        quat    = quat[keep]
+        scale   = scale[keep]
 
-    xyz = xyz[keep]
-    rgb = rgb[keep]
-    opacity = opacity[keep]
-    radius = radius[keep]
-
+    n = len(xyz)
     bbox_min = xyz.min(axis=0)
     bbox_max = xyz.max(axis=0)
     center = (bbox_min + bbox_max) * 0.5
     scene_radius = float(np.linalg.norm(bbox_max - bbox_min) * 0.5)
-    q95_radius = float(np.quantile(radius, 0.95))
-    point_scale = float(np.clip(scene_radius * 0.025 / max(q95_radius, 1e-5), 0.45, 1.8))
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    binary_name = f"{args.slug}.bin"
+    binary_name  = f"{args.slug}.bin"
     manifest_name = f"{args.slug}.json"
 
-    interleaved = np.empty((len(xyz), 8), dtype=np.float32)
-    interleaved[:, 0:3] = xyz
-    interleaved[:, 3] = radius
-    interleaved[:, 4:7] = rgb
-    interleaved[:, 7] = opacity
+    # Binary layout per splat: 16 × float32 = 64 bytes (vec4-aligned)
+    #   [0-2]  xyz position
+    #   [3]    opacity (sigmoid-activated)
+    #   [4-7]  quaternion (qw, qx, qy, qz) normalised
+    #   [8-10] scale (exp-activated sx, sy, sz)
+    #   [11]   padding
+    #   [12-14] rgb colour (DC-SH activated)
+    #   [15]   padding
+    interleaved = np.zeros((n, 16), dtype=np.float32)
+    interleaved[:, 0:3]  = xyz
+    interleaved[:, 3]    = opacity
+    interleaved[:, 4:8]  = quat         # qw qx qy qz
+    interleaved[:, 8:11] = scale
+    interleaved[:, 11]   = 0.0
+    interleaved[:, 12:15] = rgb
+    interleaved[:, 15]   = 0.0
     interleaved.tofile(output_dir / binary_name)
 
     cameras = load_cameras(args.cameras) if args.cameras else []
     camera_defaults = compute_camera_defaults(cameras, center, scene_radius)
 
     manifest = {
-        "version": 1,
+        "version": 2,
         "slug": args.slug,
         "title": args.title,
         "binary": binary_name,
-        "splatCount": int(len(xyz)),
+        "splatCount": n,
         "bounds": {
             "min": bbox_min.tolist(),
             "max": bbox_max.tolist(),
@@ -138,7 +157,6 @@ def main() -> None:
         },
         "camera": camera_defaults,
         "render": {
-            "pointScale": point_scale,
             "alphaScale": 1.0,
             "sortIntervalMs": 120,
             "backgroundTop": [0.05, 0.09, 0.17, 1.0],
@@ -147,9 +165,9 @@ def main() -> None:
     }
     (output_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
 
-    print(f"exported {len(xyz)} splats to {output_dir / manifest_name}")
-    print(f"binary size: {(output_dir / binary_name).stat().st_size / (1024 * 1024):.2f} MiB")
-    print(f"point scale: {point_scale:.3f}")
+    binary_mb = (output_dir / binary_name).stat().st_size / (1024 * 1024)
+    print(f"Exported {n:,} splats  →  {output_dir / manifest_name}")
+    print(f"Binary size: {binary_mb:.2f} MiB")
 
 
 if __name__ == "__main__":
