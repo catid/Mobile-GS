@@ -149,8 +149,9 @@ class GaussianModel:
         self.opacity_phi_nn = None
 
     def init_vnn(self, training_args=None):
-
-        mlp_input_dim = 3 * (self.max_sh_degree + 1) ** 2 + 3 + 3 + 4
+        # Use active_sh_degree (post-onedownSHdegree) so the input dim matches
+        # the truncated feature tensors actually passed at runtime.
+        mlp_input_dim = 3 * (self.active_sh_degree + 1) ** 2 + 3 + 3 + 4
 
         self.opacity_phi_nn = OpaictyPhiNN(mlp_input_dim).cuda()
         if training_args is not None:
@@ -180,13 +181,12 @@ class GaussianModel:
         )
 
     def onedownSHdegree(self):
-        if self.active_sh_degree > self.max_sh_degree:
+        if self.active_sh_degree >= 2:
             self.active_sh_degree -= 2
             num_coeffs_to_keep = (self.active_sh_degree + 1) ** 2 - 1
-        ic(num_coeffs_to_keep)
-        self._features_rest = self._features_rest.clone().detach()
-        self._features_rest = self._features_rest[:,:num_coeffs_to_keep,:]
-        self._features_rest.requires_grad = True
+            self._features_rest = self._features_rest.clone().detach()
+            self._features_rest = self._features_rest[:, :num_coeffs_to_keep, :]
+            self._features_rest.requires_grad = True
 
 
     def filter_optimizer_state(self, opt_dict):
@@ -374,8 +374,13 @@ class GaussianModel:
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        if self.net_enabled:
+            # _features_dc is stale after construct_net; use _features_static (shape N,3)
+            f_dc = self._features_static.detach().cpu().numpy()
+            f_rest = np.zeros((xyz.shape[0], self._features_rest.shape[1] * self._features_rest.shape[2]), dtype=np.float32)
+        else:
+            f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+            f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()

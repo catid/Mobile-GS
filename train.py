@@ -47,8 +47,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     opt_dict = None
     if checkpoint:
         print("loading ckpt..........")
-        (model_params, first_iter) = torch.load(checkpoint)
-        (teacher_model_params, _) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        (teacher_model_params, _) = torch.load(checkpoint, weights_only=False)
         gaussians_tea = TeaGaussianModel(sh_degree=3)
         gaussians_tea.restore(teacher_model_params)
         opt_dict = gaussians.restore(model_params, opt)
@@ -171,15 +171,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             if iteration == opt.iterations:
-                save_dict = gaussians.encode(scene.model_path)
-                save_comp(scene.model_path + "/comp.xz", save_dict)
+                try:
+                    save_dict = gaussians.encode(scene.model_path)
+                    save_comp(scene.model_path + "/comp.xz", save_dict)
 
-                actual_storage = os.path.getsize(scene.model_path + "/comp.xz")
-                with open(scene.model_path + "/storage.txt", 'w') as f:
-                    byte = {'xyz': 0, 'scale':0,  'rotation':0, 'app':0, 'MLPs':0}
-                    f.write(write_storage(save_dict, byte, gaussians.get_xyz.shape[0]))
-                    f.write("Actual storage: " + str(round(actual_storage/2**20, 2)) + " MB")
-                gaussians.decode(save_dict, decompress=False, path=scene.model_path)
+                    actual_storage = os.path.getsize(scene.model_path + "/comp.xz")
+                    with open(scene.model_path + "/storage.txt", 'w') as f:
+                        byte = {'xyz': 0, 'scale':0,  'rotation':0, 'app':0, 'MLPs':0}
+                        f.write(write_storage(save_dict, byte, gaussians.get_xyz.shape[0]))
+                        f.write("Actual storage: " + str(round(actual_storage/2**20, 2)) + " MB")
+                    gaussians.decode(save_dict, decompress=False, path=scene.model_path)
+                except Exception as e:
+                    print(f"Warning: encode/compress failed ({e}), skipping compression.")
 
 
             # Log and save
@@ -187,7 +190,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             testing_iterations, scene, render_imp, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
+                try:
+                    scene.save(iteration)
+                except Exception as e:
+                    print(f"Warning: PLY save failed ({e})")
 
             if iteration % opt.pruning_interval == 0 and iteration < opt.pruning_iter:
 
