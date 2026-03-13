@@ -8,8 +8,10 @@ import { chromium, firefox, webkit } from "playwright";
 const DOCS_ROOT = path.resolve("docs");
 const OUTPUT_ROOT = path.resolve("artifacts/browser-tests");
 const HOST = "127.0.0.1";
-const PORT = 4173;
+const PORT = Number(process.env.VIEWER_PORT ?? "4173");
 const PYTHON = existsSync(path.resolve(".venv/bin/python")) ? path.resolve(".venv/bin/python") : "python3";
+const BASE_PATH = normalizeBasePath(process.env.VIEWER_BASE_PATH ?? "/");
+const OUTPUT_SUFFIX = process.env.VIEWER_OUTPUT_SUFFIX ? `-${process.env.VIEWER_OUTPUT_SUFFIX}` : "";
 
 const MIME_TYPES = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -18,11 +20,35 @@ const MIME_TYPES = new Map([
   [".json", "application/json; charset=utf-8"],
   [".bin", "application/octet-stream"],
   [".png", "image/png"],
+  [".svg", "image/svg+xml"],
 ]);
+
+function normalizeBasePath(value) {
+  if (!value || value === "/") {
+    return "/";
+  }
+  const withLeadingSlash = value.startsWith("/") ? value : `/${value}`;
+  return withLeadingSlash.endsWith("/") ? withLeadingSlash : `${withLeadingSlash}/`;
+}
 
 async function serveStatic(request, response) {
   const requestUrl = new URL(request.url, `http://${HOST}:${PORT}`);
-  let filePath = path.join(DOCS_ROOT, decodeURIComponent(requestUrl.pathname));
+  let requestPath = decodeURIComponent(requestUrl.pathname);
+  if (BASE_PATH !== "/") {
+    if (requestPath === "/") {
+      response.writeHead(302, { Location: BASE_PATH });
+      response.end();
+      return;
+    }
+    if (!requestPath.startsWith(BASE_PATH)) {
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Not found");
+      return;
+    }
+    requestPath = requestPath.slice(BASE_PATH.length - 1) || "/";
+  }
+
+  let filePath = path.join(DOCS_ROOT, requestPath);
   if (filePath.endsWith(path.sep)) {
     filePath = path.join(filePath, "index.html");
   }
@@ -133,7 +159,7 @@ async function runBrowserTest({ name, browserType, launchOptions }) {
   );
 
   try {
-    await page.goto(`http://${HOST}:${PORT}/`, { waitUntil: "networkidle" });
+    await page.goto(`http://${HOST}:${PORT}${BASE_PATH}`, { waitUntil: "networkidle" });
     await page.waitForFunction(
       () => window.__viewerInfo?.ready === true || Boolean(window.__viewerInfo?.error),
       null,
@@ -149,7 +175,7 @@ async function runBrowserTest({ name, browserType, launchOptions }) {
       );
     }
 
-    const screenshotPath = path.join(OUTPUT_ROOT, `${name}.png`);
+    const screenshotPath = path.join(OUTPUT_ROOT, `${name}${OUTPUT_SUFFIX}.png`);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     const renderStats = analyzeScreenshot(screenshotPath);
     if (renderStats.warmRatio < 0.01) {

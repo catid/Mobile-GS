@@ -129,9 +129,10 @@ Browser verification:
 npm install
 npx playwright install chromium firefox webkit
 npm run test:viewer
+npm run test:viewer:subpath
 ```
 
-The verification script saves screenshots to `artifacts/browser-tests/` and currently exercises Chromium, Firefox, and WebKit locally. On Linux, Chromium and Firefox are launched inside Xvfb so the GPU-backed render paths can still be exercised from this machine.
+The verification script saves screenshots to `artifacts/browser-tests/` and currently exercises Chromium, Firefox, and WebKit locally. On Linux, Chromium and Firefox are launched inside Xvfb so the GPU-backed render paths can still be exercised from this machine. `test:viewer:subpath` simulates GitHub project pages under `/Mobile-GS/`.
 
 For GitHub Pages:
 - point Pages at the `docs/` directory

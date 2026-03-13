@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:viewer": "node ./scripts/test_pages_viewer.mjs"
+    "test:viewer": "node ./scripts/test_pages_viewer.mjs",
+    "test:viewer:subpath": "VIEWER_BASE_PATH=/Mobile-GS VIEWER_OUTPUT_SUFFIX=subpath VIEWER_PORT=4174 node ./scripts/test_pages_viewer.mjs"
   },
   "devDependencies": {
     "playwright": "^1.53.0"
