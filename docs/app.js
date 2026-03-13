@@ -179,6 +179,33 @@ function resizeRenderer() {
 // Sort worker
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Initial synchronous sort (runs once on boot before worker is ready)
+// ---------------------------------------------------------------------------
+
+function initialSort(splats, count) {
+  const eye = state.camera.eye;
+  const forward = state.camera.forward;
+  const depths = new Float32Array(count);
+  const indices = new Int32Array(count);
+  for (let i = 0; i < count; i++) {
+    indices[i] = i;
+    const b = i * FLOATS_PER_SPLAT;
+    depths[i] =
+      (splats[b]     - eye[0]) * forward[0] +
+      (splats[b + 1] - eye[1]) * forward[1] +
+      (splats[b + 2] - eye[2]) * forward[2];
+  }
+  // Simple descending sort — only runs once so O(N log N) is fine
+  indices.sort((a, b) => depths[b] - depths[a]);
+  const sorted = new Float32Array(splats.length);
+  for (let w = 0; w < count; w++) {
+    const src = indices[w] * FLOATS_PER_SPLAT;
+    sorted.set(splats.subarray(src, src + FLOATS_PER_SPLAT), w * FLOATS_PER_SPLAT);
+  }
+  return sorted;
+}
+
 function initSortWorker(splats) {
   const worker = new Worker(new URL("./sortWorker.js", import.meta.url), { type: "module" });
 
@@ -336,10 +363,10 @@ function animateFrame(time) {
 
   updateCamera(state.width, state.height);
 
-  // Kick off a sort if needed and enough time has passed
-  if (state.sortNeeded && !state.sortPending) {
+  // Kick off a sort if needed (or periodically to keep up with autorotate)
+  if (!state.sortPending) {
     const interval = state.pointer.active ? SORT_INTERVAL_MOVING_MS : SORT_INTERVAL_IDLE_MS;
-    if (time - state.lastSortTime >= interval) {
+    if (state.sortNeeded && time - state.lastSortTime >= interval) {
       requestSort();
     }
   }
@@ -373,13 +400,12 @@ async function boot() {
     resizeRenderer();
     updateCamera(state.width || 1, state.height || 1);
 
-    // Upload a placeholder (zeros) so the GPU buffer is allocated before
-    // the first async sort completes.
-    const placeholder = new Float32Array(scene.splats.length);
-    state.renderer.updateSceneData(placeholder);
-
+    // Do an initial synchronous sort so the scene is visible on frame 1.
     setStatus("Sorting…");
-    // Hand splat data to the worker; it will call updateSceneData when done.
+    const initialSorted = initialSort(scene.splats, scene.splatCount);
+    state.renderer.updateSceneData(initialSorted);
+
+    // Hand the original (unsorted) splat data to the worker for async sorts.
     initSortWorker(scene.splats); // transfers scene.splats.buffer to worker
 
     setStatus(`Ready · ${state.renderer.label}`);
