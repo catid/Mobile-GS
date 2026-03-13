@@ -622,7 +622,7 @@ renderCUDA(
                 const float term_S       = S * weight * diff / Wch;
                 const float term_dS      = (T_final / denom) * (A_ch / fmaxf(S, 1e-9f));
                 const float dA_dalpha_ch = term_S + term_dS;
-                const float dOut_dalpha_ch = dA_dalpha_ch + dT_dalpha * bg_c
+                const float dOut_dalpha_ch = dA_dalpha_ch + dT_dalpha * bg_c;
                 const float dOut_dweight_ch = S * alpha * diff / Wch;
 
                 dL_dalpha  += dL_dchannel * dOut_dalpha_ch;
