@@ -140,6 +140,21 @@ h1 {
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.25);
 }
 
+.fps-counter {
+  position: absolute;
+  left: 18px;
+  bottom: 18px;
+  padding: 8px 12px;
+  border-radius: 14px;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  background: rgba(7, 12, 20, 0.68);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.25);
+  color: #a8f0b8;
+}
+
 @media (max-width: 920px) {
   body {
     overflow: auto;

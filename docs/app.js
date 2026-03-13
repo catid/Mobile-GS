@@ -9,6 +9,7 @@ const rendererLabel = document.querySelector("#renderer-label");
 const statusBadge = document.querySelector("#status-badge");
 const alphaControl = document.querySelector("#alpha-control");
 const autorotateControl = document.querySelector("#autorotate-control");
+const fpsCounter = document.querySelector("#fps-counter");
 
 // Each splat is 16 floats (64 bytes): posOpacity | quat | scalePad | colorPad
 const FLOATS_PER_SPLAT = 16;
@@ -23,6 +24,11 @@ const state = {
   width: 0,
   height: 0,
   sortDeadline: 0,
+  fps: {
+    lastTime: 0,
+    frames: 0,
+    value: 0,
+  },
   pointer: {
     active: false,
     x: 0,
@@ -296,6 +302,14 @@ function animateFrame(time) {
   resizeRenderer();
   if (autorotateControl.checked && !state.pointer.active) {
     state.camera.yaw += 0.0014;
+  }
+
+  state.fps.frames += 1;
+  if (time - state.fps.lastTime >= 500) {
+    state.fps.value = Math.round(state.fps.frames * 1000 / (time - state.fps.lastTime));
+    state.fps.frames = 0;
+    state.fps.lastTime = time;
+    fpsCounter.textContent = `${state.fps.value} FPS`;
   }
 
   updateCamera(state.width, state.height);
