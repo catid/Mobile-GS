@@ -93,8 +93,10 @@ def evaluate(model_paths):
             print("Unable to compute metrics for model", scene_dir)
 
 if __name__ == "__main__":
-    device = torch.device("cuda:0")
-    torch.cuda.set_device(device)
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        local_rank = min(local_rank, torch.cuda.device_count() - 1)
+        torch.cuda.set_device(torch.device(f"cuda:{local_rank}"))
 
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")

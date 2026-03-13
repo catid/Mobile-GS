@@ -93,15 +93,18 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
       
-                if self.gaussians.opacity_phi_nn is not None:
-                    self.gaussians.opacity_phi_nn.load_state_dict(torch.load(os.path.join(self.model_path,
-                                                                                                "point_cloud",
-                                                                                                "iteration_" + str(
-                                                                                                    self.loaded_iter),
-                                                                                           'opacity_phi_nn.pt'), weights_only=True))
+                opacity_phi_path = os.path.join(
+                    self.model_path,
+                    "point_cloud",
+                    "iteration_" + str(self.loaded_iter),
+                    "opacity_phi_nn.pt",
+                )
+                if self.gaussians.opacity_phi_nn is not None and os.path.exists(opacity_phi_path):
+                    self.gaussians.opacity_phi_nn.load_state_dict(torch.load(opacity_phi_path, weights_only=True))
 
-                if self.gaussians.w_bg is not None:
-                    self.gaussians.w_bg = torch.load(os.path.join(self.model_path, 'w_bg.pth'), weights_only=True)
+                w_bg_path = os.path.join(self.model_path, 'w_bg.pth')
+                if getattr(self.gaussians, "w_bg", None) is not None and os.path.exists(w_bg_path):
+                    self.gaussians.w_bg = torch.load(w_bg_path, weights_only=True)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
@@ -115,4 +118,3 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
-

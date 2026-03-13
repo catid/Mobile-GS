@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import os
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -130,4 +131,7 @@ def safe_state(silent):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda:0"))
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        local_rank = min(local_rank, torch.cuda.device_count() - 1)
+        torch.cuda.set_device(torch.device(f"cuda:{local_rank}"))

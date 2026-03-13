@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mobile-GS Web Viewer</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="panel">
+          <p class="eyebrow">Mobile-GS Web Viewer</p>
+          <h1>Lego Mini in Real Time</h1>
+          <p class="lede">
+            Static GitHub Pages viewer for a real Mobile-GS scene. WebGPU is used when available,
+            with an automatic GPU-backed fallback for browsers that do not expose it yet.
+          </p>
+          <div class="meta">
+            <span id="scene-title">Loading scene…</span>
+            <span id="renderer-label">Renderer: probing</span>
+          </div>
+          <div class="controls">
+            <label>
+              <span>Size</span>
+              <input id="size-control" type="range" min="0.4" max="2.4" step="0.01" />
+            </label>
+            <label>
+              <span>Opacity</span>
+              <input id="alpha-control" type="range" min="0.25" max="1.8" step="0.01" />
+            </label>
+            <label class="toggle">
+              <input id="autorotate-control" type="checkbox" checked />
+              <span>Auto rotate</span>
+            </label>
+          </div>
+          <p class="hint">
+            Drag to orbit. Wheel to dolly. Open this folder through GitHub Pages or any static file host.
+          </p>
+        </div>
+      </section>
+      <section class="viewport">
+        <canvas id="viewer-canvas"></canvas>
+        <div id="status-badge" class="status-badge">Booting viewer…</div>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+.venv/
+.beads/
+node_modules/
+artifacts/
+data/
+output/
+webgpu-viewer/
+webgpu_viewer/
+**/__pycache__/
+scripts/capture_webgpu_viewer.py
+scripts/export_webgpu_billboard_scene.py
+scripts/export_webgpu_scene.py
+scripts/make_webgpu_preview.py
+scripts/serve_webgpu_viewer.py
+scripts/test_webgpu_viewer.py
