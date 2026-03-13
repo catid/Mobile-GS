@@ -254,7 +254,13 @@ export class WebGL2SplatRenderer {
   updateSceneData(interleaved) {
     this.instanceCount = interleaved.length / FLOATS_PER_SPLAT;
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.instanceBuffer);
-    this.gl.bufferData(this.gl.ARRAY_BUFFER, interleaved, this.gl.DYNAMIC_DRAW);
+    // bufferSubData reuses existing GPU allocation; bufferData re-allocates.
+    if (this._instanceBufferSize === interleaved.byteLength) {
+      this.gl.bufferSubData(this.gl.ARRAY_BUFFER, 0, interleaved);
+    } else {
+      this.gl.bufferData(this.gl.ARRAY_BUFFER, interleaved, this.gl.DYNAMIC_DRAW);
+      this._instanceBufferSize = interleaved.byteLength;
+    }
   }
 
   setRenderOptions(options) {

@@ -14,21 +14,22 @@ const fpsCounter = document.querySelector("#fps-counter");
 // Each splat is 16 floats (64 bytes): posOpacity | quat | scalePad | colorPad
 const FLOATS_PER_SPLAT = 16;
 
+// How long (ms) to wait before requesting another sort when the camera is still.
+const SORT_INTERVAL_IDLE_MS = 200;
+// How long (ms) after camera movement before re-sort while interacting.
+const SORT_INTERVAL_MOVING_MS = 40;
+
 const state = {
   scene: null,
-  originalSplats: null,
-  sortedSplats: null,
-  sortIndices: [],
-  depths: null,
   renderer: null,
   width: 0,
   height: 0,
-  sortDeadline: 0,
-  fps: {
-    lastTime: 0,
-    frames: 0,
-    value: 0,
-  },
+  // Sort worker state
+  worker: null,
+  sortPending: false,       // a sort request is in flight
+  sortNeeded: false,        // camera moved since last sort request
+  lastSortTime: 0,
+  // Camera
   pointer: {
     active: false,
     x: 0,
@@ -51,7 +52,16 @@ const state = {
   renderOptions: {
     alphaScale: 1.0,
   },
+  fps: {
+    lastTime: 0,
+    frames: 0,
+    value: 0,
+  },
 };
+
+// ---------------------------------------------------------------------------
+// Math helpers
+// ---------------------------------------------------------------------------
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -92,19 +102,12 @@ function perspective(out, fovY, aspect, near, far) {
   const f = 1.0 / Math.tan(fovY / 2.0);
   const nf = 1.0 / (near - far);
   out[0] = f / aspect;
-  out[1] = 0;
-  out[2] = 0;
-  out[3] = 0;
-  out[4] = 0;
-  out[5] = f;
-  out[6] = 0;
-  out[7] = 0;
-  out[8] = 0;
-  out[9] = 0;
+  out[1] = 0; out[2] = 0; out[3] = 0;
+  out[4] = 0; out[5] = f; out[6] = 0; out[7] = 0;
+  out[8] = 0; out[9] = 0;
   out[10] = (far + near) * nf;
   out[11] = -1;
-  out[12] = 0;
-  out[13] = 0;
+  out[12] = 0; out[13] = 0;
   out[14] = (2 * far * near) * nf;
   out[15] = 0;
   return out;
@@ -114,22 +117,12 @@ function lookAt(out, eye, target, up) {
   const zAxis = normalize(new Float32Array(3), sub(new Float32Array(3), eye, target));
   const xAxis = normalize(new Float32Array(3), cross(new Float32Array(3), up, zAxis));
   const yAxis = cross(new Float32Array(3), zAxis, xAxis);
-
-  out[0] = xAxis[0];
-  out[1] = yAxis[0];
-  out[2] = zAxis[0];
-  out[3] = 0;
-  out[4] = xAxis[1];
-  out[5] = yAxis[1];
-  out[6] = zAxis[1];
-  out[7] = 0;
-  out[8] = xAxis[2];
-  out[9] = yAxis[2];
-  out[10] = zAxis[2];
-  out[11] = 0;
-  out[12] = -(xAxis[0] * eye[0] + xAxis[1] * eye[1] + xAxis[2] * eye[2]);
-  out[13] = -(yAxis[0] * eye[0] + yAxis[1] * eye[1] + yAxis[2] * eye[2]);
-  out[14] = -(zAxis[0] * eye[0] + zAxis[1] * eye[1] + zAxis[2] * eye[2]);
+  out[0] = xAxis[0]; out[1] = yAxis[0]; out[2] = zAxis[0]; out[3] = 0;
+  out[4] = xAxis[1]; out[5] = yAxis[1]; out[6] = zAxis[1]; out[7] = 0;
+  out[8] = xAxis[2]; out[9] = yAxis[2]; out[10] = zAxis[2]; out[11] = 0;
+  out[12] = -(xAxis[0]*eye[0] + xAxis[1]*eye[1] + xAxis[2]*eye[2]);
+  out[13] = -(yAxis[0]*eye[0] + yAxis[1]*eye[1] + yAxis[2]*eye[2]);
+  out[14] = -(zAxis[0]*eye[0] + zAxis[1]*eye[1] + zAxis[2]*eye[2]);
   out[15] = 1;
   return out;
 }
@@ -146,6 +139,10 @@ function multiplyMatrices(out, a, b) {
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
 
 function updateCamera(width, height) {
   const aspect = Math.max(width / Math.max(height, 1), 1e-3);
@@ -165,9 +162,6 @@ function updateCamera(width, height) {
 
   const view = lookAt(new Float32Array(16), state.camera.eye, state.camera.target, state.camera.up);
   multiplyMatrices(state.camera.viewProjection, projection, view);
-
-  // Store view matrix and focal length for the 3DGS covariance shader.
-  // projection[5] = 1/tan(fovY/2), so focal_y = height * 0.5 * projection[5]
   state.camera.view = view;
   state.camera.focal = height * 0.5 * projection[5];
 }
@@ -175,47 +169,76 @@ function updateCamera(width, height) {
 function resizeRenderer() {
   const width = Math.floor(canvas.clientWidth * window.devicePixelRatio);
   const height = Math.floor(canvas.clientHeight * window.devicePixelRatio);
-  if (width === state.width && height === state.height) {
-    return;
-  }
+  if (width === state.width && height === state.height) return;
   state.width = width;
   state.height = height;
   state.renderer.resize(width, height);
 }
 
-function scheduleSortNow() {
-  state.sortDeadline = 0;
+// ---------------------------------------------------------------------------
+// Sort worker
+// ---------------------------------------------------------------------------
+
+function initSortWorker(splats) {
+  const worker = new Worker(new URL("./sortWorker.js", import.meta.url), { type: "module" });
+
+  worker.onmessage = function (e) {
+    const msg = e.data;
+
+    if (msg.type === "ready") {
+      // Worker initialised — request first sort immediately
+      state.sortPending = false;
+      requestSort();
+      return;
+    }
+
+    if (msg.type === "skipped") {
+      // Worker's output buffer was still in transit; retry next frame
+      state.sortPending = false;
+      state.sortNeeded = true;
+      return;
+    }
+
+    if (msg.type === "sorted") {
+      const sorted = new Float32Array(msg.buffer);
+      state.renderer.updateSceneData(sorted);
+      state.sortPending = false;
+      state.lastSortTime = performance.now();
+
+      // Return the buffer to the worker for reuse
+      worker.postMessage({ type: "returnBuffer", buffer: sorted.buffer }, [sorted.buffer]);
+
+      // If camera moved while sort was in flight, kick off another one
+      if (state.sortNeeded) {
+        requestSort();
+      }
+    }
+  };
+
+  // Transfer splat data to worker (zero-copy)
+  worker.postMessage({ type: "init", splats }, [splats.buffer]);
+  state.worker = worker;
+  state.sortPending = true; // waiting for "ready"
 }
 
-function updateSortedSplats(force = false) {
-  const now = performance.now();
-  if (!force && now < state.sortDeadline) {
-    return;
-  }
-
-  const count = state.originalSplats.length / FLOATS_PER_SPLAT;
-  const eye = state.camera.eye;
-  const forward = state.camera.forward;
-
-  for (let idx = 0; idx < count; idx += 1) {
-    const base = idx * FLOATS_PER_SPLAT;
-    const dx = state.originalSplats[base + 0] - eye[0];
-    const dy = state.originalSplats[base + 1] - eye[1];
-    const dz = state.originalSplats[base + 2] - eye[2];
-    state.depths[idx] = dx * forward[0] + dy * forward[1] + dz * forward[2];
-  }
-
-  state.sortIndices.sort((a, b) => state.depths[b] - state.depths[a]);
-
-  for (let writeIndex = 0; writeIndex < count; writeIndex += 1) {
-    const src = state.sortIndices[writeIndex] * FLOATS_PER_SPLAT;
-    const dst = writeIndex * FLOATS_PER_SPLAT;
-    state.sortedSplats.set(state.originalSplats.subarray(src, src + FLOATS_PER_SPLAT), dst);
-  }
-
-  state.renderer.updateSceneData(state.sortedSplats);
-  state.sortDeadline = now + state.scene.render.sortIntervalMs;
+function requestSort() {
+  if (state.sortPending || !state.worker) return;
+  state.sortPending = true;
+  state.sortNeeded = false;
+  state.worker.postMessage({
+    type: "sort",
+    eye:     Array.from(state.camera.eye),
+    forward: Array.from(state.camera.forward),
+  });
 }
+
+function scheduleSort() {
+  state.sortNeeded = true;
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
 
 function setStatus(message) {
   statusBadge.textContent = message;
@@ -223,13 +246,9 @@ function setStatus(message) {
 
 async function chooseRenderer(scene) {
   const webgpu = await WebGPUSplatRenderer.create(canvas, scene);
-  if (webgpu) {
-    return webgpu;
-  }
+  if (webgpu) return webgpu;
   const webgl = await WebGL2SplatRenderer.create(canvas, scene);
-  if (webgl) {
-    return webgl;
-  }
+  if (webgl) return webgl;
   throw new Error("This browser does not expose WebGPU or WebGL2.");
 }
 
@@ -247,21 +266,17 @@ function bindControls() {
   });
 
   canvas.addEventListener("pointermove", (event) => {
-    if (!state.pointer.active) {
-      return;
-    }
+    if (!state.pointer.active) return;
     const dx = event.clientX - state.pointer.x;
     const dy = event.clientY - state.pointer.y;
     state.pointer.x = event.clientX;
     state.pointer.y = event.clientY;
     state.camera.yaw -= dx * 0.006;
     state.camera.pitch = clamp(state.camera.pitch - dy * 0.006, -1.25, 1.25);
-    scheduleSortNow();
+    scheduleSort();
   });
 
-  const releasePointer = () => {
-    state.pointer.active = false;
-  };
+  const releasePointer = () => { state.pointer.active = false; };
   canvas.addEventListener("pointerup", releasePointer);
   canvas.addEventListener("pointercancel", releasePointer);
 
@@ -269,14 +284,18 @@ function bindControls() {
     event.preventDefault();
     const scale = Math.exp(event.deltaY * 0.001);
     state.camera.distance = clamp(state.camera.distance * scale, 0.8, 20.0);
-    scheduleSortNow();
+    scheduleSort();
   }, { passive: false });
 }
 
+// ---------------------------------------------------------------------------
+// Scene load
+// ---------------------------------------------------------------------------
+
 async function loadScene() {
-  const manifest = await fetch(SCENE_MANIFEST_URL).then((response) => response.json());
+  const manifest = await fetch(SCENE_MANIFEST_URL).then((r) => r.json());
   const binaryUrl = new URL(manifest.binary, new URL(SCENE_MANIFEST_URL, window.location.href)).toString();
-  const buffer = await fetch(binaryUrl).then((response) => response.arrayBuffer());
+  const buffer = await fetch(binaryUrl).then((r) => r.arrayBuffer());
   manifest.binaryUrl = binaryUrl;
   manifest.splats = new Float32Array(buffer);
   return manifest;
@@ -284,10 +303,6 @@ async function loadScene() {
 
 function initializeScene(scene) {
   state.scene = scene;
-  state.originalSplats = scene.splats;
-  state.sortedSplats = new Float32Array(scene.splats.length);
-  state.sortIndices = Array.from({ length: scene.splatCount }, (_, idx) => idx);
-  state.depths = new Float32Array(scene.splatCount);
   state.camera.target = scene.bounds.center.slice();
   state.camera.yaw = scene.camera.yaw;
   state.camera.pitch = scene.camera.pitch;
@@ -298,12 +313,19 @@ function initializeScene(scene) {
   sceneTitle.textContent = `${scene.title} · ${scene.splatCount.toLocaleString()} splats`;
 }
 
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
+
 function animateFrame(time) {
   resizeRenderer();
+
   if (autorotateControl.checked && !state.pointer.active) {
     state.camera.yaw += 0.0014;
+    scheduleSort();
   }
 
+  // FPS counter
   state.fps.frames += 1;
   if (time - state.fps.lastTime >= 500) {
     state.fps.value = Math.round(state.fps.frames * 1000 / (time - state.fps.lastTime));
@@ -313,7 +335,15 @@ function animateFrame(time) {
   }
 
   updateCamera(state.width, state.height);
-  updateSortedSplats();
+
+  // Kick off a sort if needed and enough time has passed
+  if (state.sortNeeded && !state.sortPending) {
+    const interval = state.pointer.active ? SORT_INTERVAL_MOVING_MS : SORT_INTERVAL_IDLE_MS;
+    if (time - state.lastSortTime >= interval) {
+      requestSort();
+    }
+  }
+
   state.renderer.render(state.camera);
   window.__viewerInfo = {
     renderer: state.renderer.label,
@@ -324,30 +354,41 @@ function animateFrame(time) {
   requestAnimationFrame(animateFrame);
 }
 
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
 async function boot() {
   try {
     setStatus("Loading scene asset…");
     const scene = await loadScene();
     initializeScene(scene);
+
     setStatus("Selecting renderer…");
     state.renderer = await chooseRenderer(scene);
     rendererLabel.textContent = `Renderer: ${state.renderer.label}`;
     state.renderer.setRenderOptions(state.renderOptions);
+
     bindControls();
     resizeRenderer();
     updateCamera(state.width || 1, state.height || 1);
-    updateSortedSplats(true);
+
+    // Upload a placeholder (zeros) so the GPU buffer is allocated before
+    // the first async sort completes.
+    const placeholder = new Float32Array(scene.splats.length);
+    state.renderer.updateSceneData(placeholder);
+
+    setStatus("Sorting…");
+    // Hand splat data to the worker; it will call updateSceneData when done.
+    initSortWorker(scene.splats); // transfers scene.splats.buffer to worker
+
     setStatus(`Ready · ${state.renderer.label}`);
     requestAnimationFrame(animateFrame);
   } catch (error) {
     console.error(error);
     rendererLabel.textContent = "Renderer: unavailable";
     setStatus(error.message);
-    window.__viewerInfo = {
-      renderer: "unsupported",
-      ready: false,
-      error: error.message,
-    };
+    window.__viewerInfo = { renderer: "unsupported", ready: false, error: error.message };
   }
 }
 

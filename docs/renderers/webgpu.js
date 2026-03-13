@@ -288,13 +288,14 @@ export class WebGPUSplatRenderer {
   }
 
   updateSceneData(interleaved) {
-    if (this.instanceBuffer) {
-      this.instanceBuffer.destroy();
+    // Reuse the existing buffer if same size; only reallocate when it changes.
+    if (!this.instanceBuffer || this.instanceBuffer.size !== interleaved.byteLength) {
+      if (this.instanceBuffer) this.instanceBuffer.destroy();
+      this.instanceBuffer = this.device.createBuffer({
+        size: interleaved.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
     }
-    this.instanceBuffer = this.device.createBuffer({
-      size: interleaved.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
     this.device.queue.writeBuffer(
       this.instanceBuffer, 0,
       interleaved.buffer, interleaved.byteOffset, interleaved.byteLength,
