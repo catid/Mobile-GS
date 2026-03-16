@@ -55,11 +55,15 @@ finetune MLP weights are not saved.
 
 ### Web viewer
 - Serves `docs/` via GitHub Pages (`catid.github.io/Mobile-GS`)
-- Uses `docs/assets/scenes/lego-mini.{bin,json}` — currently pretrain 30k (36.5 dB)
+- Uses `docs/assets/scenes/lego-mini.{bin,json}` — currently pretrain 30k (36.17 dB, white bg)
 - Renderer: WebGPU preferred, WebGL2 fallback; both implement full 3DGS covariance projection
-- Sort is done in a **Web Worker** using radix sort (2.5× faster than Array.sort) with
-  zero-copy ping-pong buffer transfer; sort is required for correct alpha compositing
-- Validated PSNR: native render 36.47 dB test views; web viewer matches via DC-SH eval
+- **Two-pass Mobile-GS _ms formula** (no sort needed):
+  - Pass 1: additive accumulation into rgba16float FBO — `(color*alpha_w, alpha_w)` per pixel
+    `alpha_w = opacity * exp(-power) * alphaScale * weight`, `weight = exp(min(max_scale/depth, 20))`
+  - Pass 2: compose — `coverage = 1-exp(-w_fg)`, `output = mix(bg, C/w_fg, coverage)`
+- Note: pretrain model was trained with standard compositing (`render_impori`), so _ms rendering
+  may look slightly different from offline renders. The full fine-tuned model (trained with `_ms`)
+  will match correctly. Binary format v4: geometry (12 f32/splat) + SH (48 f32/splat).
 
 ### SSH / push
 No GitHub SSH key on the dev machine (`id_ed25519_kuang2` is for `kuang2.lan` only).
