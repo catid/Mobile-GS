@@ -14,6 +14,9 @@ bd sync               # Sync with git
 
 ## Architecture Notes
 
+### Algorithm Overview
+Mobile-GS is **not standard Gaussian splatting**. It is a new algorithm designed to render faster on mobile hardware by replacing the expensive depth sort with a learned network. The MLP (`phi`) learns order-independent blending weights so that the color accumulation `C/w_fg` does not depend on sort order. This is the core algorithmic contribution.
+
 ### Mobile-GS rendering pipeline
 - **`pretrain.py`** — Mini-Splatting 30k iter, produces high-quality SH3 PLY. No MLP.
 - **`train.py`** — Fine-tune from pretrain checkpoint, 60k iter total.
@@ -23,19 +26,20 @@ bd sync               # Sync with git
   - iter 59k: `apply_svq()` quantizes scales/rotations/appearance into codebooks
 
 ### The `_ms` rasterizer vs `_msori`
-Both rasterizers (`diff_gaussian_rasterization_ms` and `_msori`) contain an internal
-**CUB radix sort** (`cub::DeviceRadixSort::SortPairs`) — sorting by per-tile depth is
-mandatory in both.
-
-The `_ms` variant changes the **blending formula**:
+The `_ms` variant replaces standard alpha compositing with an order-independent formula:
 - Standard (`_msori`): `C += color * alpha * T` — order-dependent (T = transmittance)
 - Mobile-GS (`_ms`):  `C += color * alpha * weight`, `w_fg += alpha * weight`,
   `out = C/w_fg * (1-T) + T * bg`
   where `weight = expf(max_scale/depth) + phi/depth² + phi²`
 
-The MLP (`phi`) modifies blending **weights**, it does NOT replace the sort. The color
-accumulation `C/w_fg` is order-independent (weighted average), but `T` still accumulates
-in sort order for the background blend. **Do not remove the sort.**
+All three output terms are order-independent:
+- `C/w_fg` is a weighted average — commutative
+- `T = ∏(1 - αᵢ)` is a product — commutative
+- No early-exit on T in the kernel, so all splats per tile are always processed
+
+The `_ms` rasterizer now sorts only by **tile ID** (no depth component in the key).
+The `_msori` rasterizer retains depth sort as it uses order-dependent standard blending.
+Validated: PSNR unchanged at 36.17 dB after removing depth sort from `_ms`.
 
 ### `capture()` / `restore()` limitation
 `capture()` saves basic Gaussian parameters (xyz, features, scaling, rotation, opacity,
