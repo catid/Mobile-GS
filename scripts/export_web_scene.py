@@ -62,6 +62,8 @@ def main() -> None:
     parser.add_argument("--title", required=True)
     parser.add_argument("--max-splats", type=int, default=0,
                         help="Maximum splats to export (0 = keep all)")
+    parser.add_argument("--white_background", action="store_true",
+                        help="Use white background (for models trained with white_background=True)")
     args = parser.parse_args()
 
     ply = PlyData.read(args.ply)["vertex"]
@@ -181,8 +183,8 @@ def main() -> None:
         "render": {
             "alphaScale": 1.0,
             "sortIntervalMs": 120,
-            "backgroundTop": [0.0, 0.0, 0.0, 1.0],
-            "backgroundBottom": [0.0, 0.0, 0.0, 1.0],
+            "backgroundTop": [1.0, 1.0, 1.0, 1.0] if args.white_background else [0.0, 0.0, 0.0, 1.0],
+            "backgroundBottom": [1.0, 1.0, 1.0, 1.0] if args.white_background else [0.0, 0.0, 0.0, 1.0],
         },
     }
     (output_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
