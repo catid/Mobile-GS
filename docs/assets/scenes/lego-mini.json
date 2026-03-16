@@ -1,7 +1,7 @@
 {
   "version": 4,
   "slug": "lego-mini",
-  "title": "Mobile-GS Lego (pretrain 30k, SH3, white bg)",
+  "title": "Mobile-GS Lego (_ms fine-tune 30k, SH3, 29 dB)",
   "binary": "lego-mini.bin",
   "splatCount": 210707,
   "bounds": {
@@ -23,10 +23,10 @@
     "radius": 1.5384984016418457
   },
   "camera": {
-    "yaw": -0.007449122528482456,
-    "pitch": 0.8008197556491323,
-    "distance": 3.8223400115966797,
-    "fovY": 0.6911112070083618
+    "yaw": 0.9,
+    "pitch": 0.45,
+    "distance": 4.000095844268799,
+    "fovY": 0.8028514559173916
   },
   "render": {
     "alphaScale": 1.0,
