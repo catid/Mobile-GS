@@ -14,7 +14,7 @@ from scene import Scene
 import os
 from tqdm import tqdm
 from os import makedirs
-from gaussian_renderer import render
+from gaussian_renderer import render_impori as render
 import torchvision
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
@@ -41,7 +41,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, decode : bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
-        gaussians.init_vnn()
 
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, decode=decode)
         print("Gaussian number: ", len(gaussians.get_xyz))
