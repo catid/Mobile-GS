@@ -368,11 +368,11 @@ renderCUDA(
 			float phi = collected_phi[j];
 			float depth = collected_depth[j];
 			if (depth < 0) continue;
-            depth = fmaxf(depth, 1e-6);
+            depth = fmaxf(depth, 0.1f);
             glm::vec3 scale = collected_scales[j];
             float max_scale = fmaxf(scale.x, fmaxf(scale.y, scale.z));
 
-            float weight = expf(max_scale / depth ) + phi / (depth * depth) + phi*phi ;
+            float weight = expf(fminf(max_scale / depth, 20.0f)) + phi / (depth * depth) + phi*phi;
 
 
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
@@ -427,7 +427,7 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			{
-                out_color[ch * H * W + pix_id] = C[ch] / w_fg_c[ch] * (1-T) + T * bg_color[ch];
+                out_color[ch * H * W + pix_id] = (w_fg_c[ch] > 0.0f ? C[ch] / w_fg_c[ch] * (1-T) : 0.0f) + T * bg_color[ch];
                 w_fg[ch * H * W + pix_id] = w_fg_c[ch];
 
 			}
