@@ -142,23 +142,23 @@ def main() -> None:
     binary_name  = f"{args.slug}.bin"
     manifest_name = f"{args.slug}.json"
 
-    # Binary format v4: two sections
-    # Section 1: geometry (12 floats per splat)
+    # Binary format v5: two sections — geometry as float32, SH as float16
+    # Section 1: geometry (11 floats per splat, float32)
     #   [0-2]  xyz position
     #   [3]    opacity (sigmoid-activated)
     #   [4-7]  quaternion (qw, qx, qy, qz) normalised
     #   [8-10] scale (exp-activated sx, sy, sz)
-    #   [11]   float(originalIndex)
-    # Section 2: SH (48 floats per splat): sh_r[0..15], sh_g[0..15], sh_b[0..15]
-    geom = np.zeros((n, 12), dtype=np.float32)
+    #   (origIndex removed — renderer uses instance ID instead)
+    # Section 2: SH (48 float16 per splat): sh_r[0..15], sh_g[0..15], sh_b[0..15]
+    #   Float16 SH: max quantization error ~0.007, below 1-bit display precision
+    geom = np.zeros((n, 11), dtype=np.float32)
     geom[:, 0:3]  = xyz
     geom[:, 3]    = opacity
     geom[:, 4:8]  = quat
     geom[:, 8:11] = scale
-    geom[:, 11]   = np.arange(n, dtype=np.float32)  # original splat index
 
-    # Section 2: SH (48 floats per splat): sh_r[0..15], sh_g[0..15], sh_b[0..15]
-    sh = np.concatenate([sh_r, sh_g, sh_b], axis=1)
+    # Section 2: SH (48 float16 per splat): sh_r[0..15], sh_g[0..15], sh_b[0..15]
+    sh = np.concatenate([sh_r, sh_g, sh_b], axis=1).astype(np.float16)
 
     with open(output_dir / binary_name, "wb") as f:
         geom.tofile(f)
@@ -168,7 +168,7 @@ def main() -> None:
     camera_defaults = compute_camera_defaults(cameras, center, scene_radius)
 
     manifest = {
-        "version": 4,
+        "version": 5,
         "slug": args.slug,
         "title": args.title,
         "binary": binary_name,

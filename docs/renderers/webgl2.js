@@ -1,14 +1,19 @@
 // Mobile-GS two-pass renderer — matches the _ms CUDA blending formula (phi=0):
-//   Pass 1: accumulate (color * alpha_w, alpha_w) additively into RGBA16F FBO
-//   Pass 2: compose — C/w_fg * coverage + bg*(1-coverage), coverage=1-exp(-w_fg)
+//   Pass 1: MRT with two render targets
+//     target 0 (RGBA float): accumulate (color*alpha_w, alpha_w) additively
+//     target 1 (R float):    accumulate log(1-alpha_clamped) additively
+//   Pass 2: compose
+//     T        = exp(logT_accum)  -- = prod(1-alpha_i), exact transmittance
+//     coverage = 1 - T            -- matches CUDA formula exactly
+//   alpha = min(0.99, opacity * exp(-power) * alphaScale)  -- clamped as in CUDA
 //   weight = exp(min(max_scale / depth, 20))  — geometry-based, no MLP needed
 //
 // Geometry vertex buffer layout (12 floats = 48 bytes per splat):
 //   offset  0 : vec4  posOpacity  (x, y, z, opacity)
 //   offset 16 : vec4  quat        (qw, qx, qy, qz)
 //   offset 32 : vec4  scaleIdx    (sx, sy, sz, float(originalIndex))
-// SH data stored in RGBA32F texture: width=2048, each splat occupies 12 texels
-const GEOM_FLOATS = 12;
+// SH data stored in RGBA16F texture: width=2048, each splat occupies 12 texels (float16)
+const GEOM_FLOATS = 11;  // v5: no origIdx — use gl_InstanceID for SH lookup
 
 // ---------------------------------------------------------------------------
 // Pass 1: splat accumulation into float FBO
@@ -19,7 +24,7 @@ precision highp sampler2D;
 
 layout(location = 0) in vec4 aPosOpacity;
 layout(location = 1) in vec4 aQuat;
-layout(location = 2) in vec4 aScaleIdx;
+layout(location = 2) in vec3 aScale;
 
 uniform mat4 uViewProj;
 uniform mat4 uView;
@@ -81,15 +86,15 @@ vec3 evalSH3(vec3 dir,
 }
 
 void main() {
-  vec3 pos=aPosOpacity.xyz; float opacity=aPosOpacity.w; vec3 scale=aScaleIdx.xyz;
-  int origIdx=int(aScaleIdx.w);
+  vec3 pos=aPosOpacity.xyz; float opacity=aPosOpacity.w; vec3 scale=aScale;
+  int origIdx=gl_InstanceID;
   vec4 pv=uView*vec4(pos,1.0); float fwd=-pv.z;
   if(fwd<0.01){gl_Position=vec4(0,0,2,1);vConic=vec3(0);vCenterPix=vec2(0);vColor=vec4(0);vWeight=0.0;return;}
   mat3 R=quatToMat(aQuat); mat3 W=mat3(uView);
   mat3 M=mat3(W*(R[0]*scale.x),W*(R[1]*scale.y),W*(R[2]*scale.z));
   mat3 Sv=M*transpose(M);
   float inv_d=1.0/fwd,inv_d2=inv_d*inv_d,tx=pv.x,ty=pv.y;
-  vec3 J0=vec3(uFocal*inv_d,0,uFocal*tx*inv_d2),J1=vec3(0,uFocal*inv_d,uFocal*ty*inv_d2);
+  vec3 J0=vec3(uFocal*inv_d,0.0,uFocal*tx*inv_d2),J1=vec3(0.0,uFocal*inv_d,uFocal*ty*inv_d2);
   float cov00=dot(J0,Sv*J0)+0.3,cov01=dot(J0,Sv*J1),cov11=dot(J1,Sv*J1)+0.3;
   float det=cov00*cov11-cov01*cov01;
   if(det<=0.0){gl_Position=vec4(0,0,2,1);vConic=vec3(0);vCenterPix=vec2(0);vColor=vec4(0);vWeight=0.0;return;}
@@ -122,15 +127,20 @@ in float vWeight;
 
 uniform float uAlphaScale;
 
-out vec4 outAccum;  // rgb = color * alpha_w,  a = alpha_w (w_fg)
+layout(location = 0) out vec4 outAccum;  // rgb = color * alpha_w,  a = alpha_w (w_fg)
+layout(location = 1) out float outLogT;  // log(1 - alpha_clamped) — negative, sums to log(T)
 
 void main() {
   vec2 d = gl_FragCoord.xy - vCenterPix;
   float power = 0.5*(vConic.x*d.x*d.x + 2.0*vConic.y*d.x*d.y + vConic.z*d.y*d.y);
   if (power > 8.0) discard;
-  float alpha_w = vColor.a * exp(-power) * uAlphaScale * vWeight;
+  // alpha clamped at 0.99 as in CUDA kernel — affects both T and w_fg
+  float alpha = min(0.99, vColor.a * exp(-power) * uAlphaScale);
+  float alpha_w = alpha * vWeight;
   if (alpha_w < 0.00001) discard;
   outAccum = vec4(vColor.rgb * alpha_w, alpha_w);
+  // log-transmittance: weight-independent, matches CUDA T = prod(1-alpha)
+  outLogT = log(1.0 - alpha);
 }
 `;
 
@@ -148,14 +158,18 @@ void main() {
 const COMPOSE_FRAG = `#version 300 es
 precision highp float;
 uniform highp sampler2D uAccum;
+uniform highp sampler2D uLogT;
 uniform vec3 uBgColor;
 out vec4 outColor;
 void main() {
   vec2 uv = gl_FragCoord.xy / vec2(textureSize(uAccum, 0));
   vec4 accum = texture(uAccum, uv);
+  float logT  = texture(uLogT, uv).r;
   float w_fg = accum.a;
   vec3 C_fg = (w_fg > 0.0001) ? accum.rgb / w_fg : vec3(0.0);
-  float coverage = 1.0 - exp(-w_fg);
+  // T = prod(1-alpha_i); cleared to 0 → exp(0)=1; splats add negative values → T→0
+  float T = exp(logT);
+  float coverage = 1.0 - T;
   outColor = vec4(mix(uBgColor, C_fg, coverage), 1.0);
 }
 `;
@@ -198,9 +212,10 @@ export class WebGL2SplatRenderer {
         premultipliedAlpha: true,
       });
       if (!gl) return null;
-      // Need float renderable textures for accumulation FBO
-      if (!gl.getExtension("EXT_color_buffer_float") &&
-          !gl.getExtension("EXT_color_buffer_half_float")) {
+      // Need float renderable textures for accumulation FBO (incl. single-channel R format)
+      const hasFloat     = !!gl.getExtension("EXT_color_buffer_float");
+      const hasHalfFloat = !!gl.getExtension("EXT_color_buffer_half_float");
+      if (!hasFloat && !hasHalfFloat) {
         console.warn("WebGL2: no float color buffer support");
         return null;
       }
@@ -223,9 +238,12 @@ export class WebGL2SplatRenderer {
     this._fboHeight = 0;
 
     // Determine best float format for the accumulation FBO
-    this._floatFmt = gl.getExtension("EXT_color_buffer_float")
-      ? gl.RGBA32F : gl.RGBA16F;
-    this._floatType = this._floatFmt === gl.RGBA32F ? gl.FLOAT : gl.HALF_FLOAT;
+    const hasFloat = !!gl.getExtension("EXT_color_buffer_float");
+    this._floatFmt  = hasFloat ? gl.RGBA32F : gl.RGBA16F;
+    this._floatType = hasFloat ? gl.FLOAT   : gl.HALF_FLOAT;
+    // Single-channel float format for log-transmittance render target
+    this._r1Fmt  = hasFloat ? gl.R32F   : gl.R16F;
+    this._r1Type = hasFloat ? gl.FLOAT  : gl.HALF_FLOAT;
 
     // Splat accumulation program
     this.splatProgram   = linkProgram(gl, SPLAT_VERT, SPLAT_FRAG);
@@ -246,25 +264,33 @@ export class WebGL2SplatRenderer {
     // Compose program uniform locations
     this.composeLoc = {
       accum:   gl.getUniformLocation(this.composeProgram, "uAccum"),
+      logT:    gl.getUniformLocation(this.composeProgram, "uLogT"),
       bgColor: gl.getUniformLocation(this.composeProgram, "uBgColor"),
     };
 
     // Geometry vertex buffer + VAO
+    // v5 layout: attr0=vec4 (pos+opacity), attr1=vec4 (quat), attr2=vec3 (scale)
+    // stride = 11 floats = 44 bytes
     this.instanceBuffer = gl.createBuffer();
     this.vao = gl.createVertexArray();
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
-    const stride = GEOM_FLOATS * 4;
-    for (let i = 0; i < 3; i++) {
-      gl.enableVertexAttribArray(i);
-      gl.vertexAttribPointer(i, 4, gl.FLOAT, false, stride, i * 16);
-      gl.vertexAttribDivisor(i, 1);
-    }
+    const stride = GEOM_FLOATS * 4;  // 44 bytes
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 4, gl.FLOAT, false, stride, 0);    // vec4 pos+opacity
+    gl.vertexAttribDivisor(0, 1);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 16);   // vec4 quat
+    gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, stride, 32);   // vec3 scale
+    gl.vertexAttribDivisor(2, 1);
     gl.bindVertexArray(null);
 
     // Accumulation FBO (created on first resize)
     this.accumFBO     = gl.createFramebuffer();
     this.accumTexture = gl.createTexture();
+    this.logTTexture  = gl.createTexture();
 
     // Background colour
     this._bg = scene.render.backgroundTop.slice(0, 3);
@@ -277,16 +303,24 @@ export class WebGL2SplatRenderer {
     const gl = this.gl;
     this._fboWidth  = width;
     this._fboHeight = height;
-    gl.bindTexture(gl.TEXTURE_2D, this.accumTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, this._floatFmt, width, height, 0,
-                  gl.RGBA, this._floatType, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const setupTex = (tex, internalFmt, fmt, type) => {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, internalFmt, width, height, 0, fmt, type, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    };
+
+    setupTex(this.accumTexture, this._floatFmt, gl.RGBA, this._floatType);
+    setupTex(this.logTTexture,  this._r1Fmt,   gl.RED,  this._r1Type);
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
                             gl.TEXTURE_2D, this.accumTexture, 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1,
+                            gl.TEXTURE_2D, this.logTTexture,  0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
@@ -299,12 +333,14 @@ export class WebGL2SplatRenderer {
   }
 
   initSHData(shData) {
+    // shData: Uint16Array of raw float16 bits (v5 format), N*48 elements
     const gl = this.gl;
     const N = shData.length / 48;
     const SH_TEX_WIDTH = 2048;
     const totalTexels  = N * 12;
     const height = Math.ceil(totalTexels / SH_TEX_WIDTH);
-    const texData = new Float32Array(SH_TEX_WIDTH * height * 4);
+    // Pad to full rows if needed (Uint16Array: 4 channels × 2 bytes = 8 bytes/texel)
+    const texData = new Uint16Array(SH_TEX_WIDTH * height * 4);
     texData.set(shData);
     if (!this.shTexture) this.shTexture = gl.createTexture();
     gl.activeTexture(gl.TEXTURE1);
@@ -313,8 +349,9 @@ export class WebGL2SplatRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SH_TEX_WIDTH, height, 0,
-                  gl.RGBA, gl.FLOAT, texData);
+    // Upload float16 directly as RGBA16F texture (no CPU conversion needed)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, SH_TEX_WIDTH, height, 0,
+                  gl.RGBA, gl.HALF_FLOAT, texData);
     gl.bindTexture(gl.TEXTURE_2D, null);
     this.splatLoc.shData = gl.getUniformLocation(this.splatProgram, "uSHData");
   }
@@ -341,10 +378,12 @@ export class WebGL2SplatRenderer {
     const H  = this.canvas.height;
     this._ensureFBO(W, H);
 
-    // ── Pass 1: accumulate splats into float FBO ─────────────────────────
+    // ── Pass 1: accumulate splats into float FBO (MRT) ───────────────────
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
+    // Enable both color attachments: accum + logT
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.viewport(0, 0, W, H);
-    gl.clearColor(0, 0, 0, 0);
+    gl.clearColor(0, 0, 0, 0);  // logT cleared to 0 → T=exp(0)=1 (fully transparent)
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
@@ -380,6 +419,9 @@ export class WebGL2SplatRenderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.accumTexture);
     gl.uniform1i(this.composeLoc.accum,   0);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.logTTexture);
+    gl.uniform1i(this.composeLoc.logT,    2);
     gl.uniform3fv(this.composeLoc.bgColor, this._bg);
 
     gl.drawArrays(gl.TRIANGLES, 0, 3);

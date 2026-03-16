@@ -11,8 +11,9 @@ const alphaControl = document.querySelector("#alpha-control");
 const autorotateControl = document.querySelector("#autorotate-control");
 const fpsCounter = document.querySelector("#fps-counter");
 
-const GEOM_FLOATS = 12;   // geometry section: pos/opacity/quat/scale/origIdx
-const SH_FLOATS   = 48;   // SH section: sh_r[16] sh_g[16] sh_b[16]
+// Binary format v5: geometry (11 f32/splat) + SH (48 f16/splat)
+const GEOM_FLOATS = 11;   // geometry: pos/opacity/quat/scale (origIdx removed, use instance ID)
+const SH_FLOATS   = 48;   // SH: sh_r[16] sh_g[16] sh_b[16], stored as float16
 
 const state = {
   scene: null,
@@ -228,7 +229,8 @@ async function loadScene() {
   const N = manifest.splatCount;
   // Split into two separate ArrayBuffers so each can be transferred independently
   manifest.geomSplats = new Float32Array(buffer.slice(0, N * GEOM_FLOATS * 4));
-  manifest.shSplats   = new Float32Array(buffer.slice(N * GEOM_FLOATS * 4));
+  // SH stored as float16 (2 bytes each) in v5; pass raw uint16 bits to renderers
+  manifest.shSplats   = new Uint16Array(buffer.slice(N * GEOM_FLOATS * 4));
   return manifest;
 }
 

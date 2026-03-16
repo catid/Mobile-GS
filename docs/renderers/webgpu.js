@@ -1,7 +1,15 @@
 // Mobile-GS two-pass WebGPU renderer — matches _ms CUDA blending formula (phi=0):
-//   Pass 1: accumulate (color*alpha_w, alpha_w) additively into rgba16float texture
-//   Pass 2: compose — C/w_fg * coverage + bg*(1-coverage), coverage=1-exp(-w_fg)
-//   weight = exp(min(max_scale / depth, 20))
+//   Pass 1: MRT with two render targets
+//     target 0 (rgba16float): accumulate (color*alpha_w, alpha_w) additively
+//     target 1 (r16float):    accumulate log(1-alpha_clamped) additively
+//   Pass 2: compose
+//     w_fg     = accum.a
+//     C_fg     = accum.rgb / w_fg
+//     T        = exp(logT_accum)  -- = prod(1-alpha_i), exact transmittance
+//     coverage = 1 - T            -- matches CUDA formula exactly
+//     output   = mix(bg, C_fg, coverage)
+//   alpha = min(0.99, opacity * exp(-power) * alphaScale)  -- clamped as in CUDA
+//   weight = exp(min(max_scale/depth, 20))                 -- in color only, not T
 //
 // Uniform buffer layout (176 bytes = 44 floats):
 //   offset   0 : mat4x4  viewProj
@@ -11,11 +19,11 @@
 //   offset 160 : vec4    eye       (ex, ey, ez, 0)
 const UNIFORM_BUFFER_SIZE = 176;
 
-// Geometry vertex buffer layout (12 floats = 48 bytes per splat):
+// Geometry vertex buffer layout (11 floats = 44 bytes per splat, v5 format):
 //   offset  0 : vec4  posOpacity  (x, y, z, opacity)
 //   offset 16 : vec4  quat        (qw, qx, qy, qz)
-//   offset 32 : vec4  scaleIdx    (sx, sy, sz, float(originalIndex))
-const GEOM_FLOATS = 12;
+//   offset 32 : vec3  scale       (sx, sy, sz)  — origIdx removed, use instance_index
+const GEOM_FLOATS = 11;
 
 // ---------------------------------------------------------------------------
 // Pass 1: splat accumulation shader
@@ -30,7 +38,8 @@ struct CameraUniforms {
 };
 
 @group(0) @binding(0) var<uniform> camera : CameraUniforms;
-@group(0) @binding(1) var<storage, read> sh_data : array<f32>;
+// SH stored as rgba16float texture: width=2048, each splat occupies 12 texels (4 f16 each)
+@group(0) @binding(1) var shTex : texture_2d<f32>;
 
 struct VertexOutput {
   @builtin(position) position  : vec4<f32>,
@@ -38,6 +47,11 @@ struct VertexOutput {
   @location(1)       centerPix : vec2<f32>,
   @location(2)       color     : vec4<f32>,  // rgb=SH color, a=opacity
   @location(3)       weight    : f32,         // exp(min(max_scale/depth, 20))
+};
+
+struct FragOut {
+  @location(0) accum : vec4<f32>,  // color*alpha_w, alpha_w (w_fg)
+  @location(1) logT  : f32,        // log(1-alpha_clamped) — negative, sums to log(T)
 };
 
 const quad = array<vec2<f32>, 6>(
@@ -54,9 +68,10 @@ fn quatToMat(q: vec4<f32>) -> mat3x3<f32> {
   );
 }
 
-fn getSH(origIdx: u32, ofs: u32) -> vec4<f32> {
-  let b = origIdx * 48u + ofs;
-  return vec4<f32>(sh_data[b], sh_data[b+1u], sh_data[b+2u], sh_data[b+3u]);
+// group=0..11: each splat has 12 texels of 4 f16 values = 48 SH coefficients
+fn getSH(origIdx: u32, group: u32) -> vec4<f32> {
+  let g = origIdx * 12u + group;
+  return textureLoad(shTex, vec2<i32>(i32(g % 2048u), i32(g / 2048u)), 0);
 }
 
 fn evalSH3(dir: vec3<f32>,
@@ -89,16 +104,17 @@ fn evalSH3(dir: vec3<f32>,
 
 @vertex
 fn vsMain(
-  @builtin(vertex_index) vi : u32,
+  @builtin(vertex_index)   vi      : u32,
+  @builtin(instance_index) instIdx : u32,
   @location(0) posOpacity : vec4<f32>,
   @location(1) quat       : vec4<f32>,
-  @location(2) scaleIdx   : vec4<f32>,
+  @location(2) scaleXYZ   : vec3<f32>,  // v5: no origIdx, use instIdx instead
 ) -> VertexOutput {
   var out: VertexOutput;
   let pos     = posOpacity.xyz;
   let opacity = posOpacity.w;
-  let scale   = scaleIdx.xyz;
-  let origIdx = u32(scaleIdx.w);
+  let scale   = scaleXYZ;
+  let origIdx = instIdx;
 
   let p_view = camera.view * vec4<f32>(pos, 1.0);
   let fwd    = -p_view.z;
@@ -145,12 +161,12 @@ fn vsMain(
   out.centerPix = vec2<f32>(cx, cy);
 
   let dir = normalize(pos - camera.eye.xyz);
-  let sh_r0 = getSH(origIdx,  0u); let sh_r1 = getSH(origIdx,  4u);
-  let sh_r2 = getSH(origIdx,  8u); let sh_r3 = getSH(origIdx, 12u);
-  let sh_g0 = getSH(origIdx, 16u); let sh_g1 = getSH(origIdx, 20u);
-  let sh_g2 = getSH(origIdx, 24u); let sh_g3 = getSH(origIdx, 28u);
-  let sh_b0 = getSH(origIdx, 32u); let sh_b1 = getSH(origIdx, 36u);
-  let sh_b2 = getSH(origIdx, 40u); let sh_b3 = getSH(origIdx, 44u);
+  let sh_r0 = getSH(origIdx,  0u); let sh_r1 = getSH(origIdx,  1u);
+  let sh_r2 = getSH(origIdx,  2u); let sh_r3 = getSH(origIdx,  3u);
+  let sh_g0 = getSH(origIdx,  4u); let sh_g1 = getSH(origIdx,  5u);
+  let sh_g2 = getSH(origIdx,  6u); let sh_g3 = getSH(origIdx,  7u);
+  let sh_b0 = getSH(origIdx,  8u); let sh_b1 = getSH(origIdx,  9u);
+  let sh_b2 = getSH(origIdx, 10u); let sh_b3 = getSH(origIdx, 11u);
   let rgb = evalSH3(dir, sh_r0,sh_r1,sh_r2,sh_r3, sh_g0,sh_g1,sh_g2,sh_g3, sh_b0,sh_b1,sh_b2,sh_b3);
   out.color = vec4<f32>(rgb, opacity);
 
@@ -160,14 +176,20 @@ fn vsMain(
 }
 
 @fragment
-fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fsMain(in: VertexOutput) -> FragOut {
   let d = in.position.xy - in.centerPix;
   let power = 0.5*(in.conic.x*d.x*d.x + 2.0*in.conic.y*d.x*d.y + in.conic.z*d.y*d.y);
   if (power > 8.0) { discard; }
-  let alpha_w = in.color.a * exp(-power) * camera.params.x * in.weight;
+  // alpha clamped at 0.99 as in the CUDA kernel — affects both T and w_fg
+  let alpha = min(0.99, in.color.a * exp(-power) * camera.params.x);
+  let alpha_w = alpha * in.weight;
   if (alpha_w < 0.00001) { discard; }
-  // Additive accumulation: rgb accumulates color*alpha_w, a accumulates alpha_w
-  return vec4<f32>(in.color.rgb * alpha_w, alpha_w);
+  var out: FragOut;
+  // target 0: color accumulation (with weight) and w_fg
+  out.accum = vec4<f32>(in.color.rgb * alpha_w, alpha_w);
+  // target 1: log-transmittance (weight-independent, as in CUDA T = prod(1-alpha))
+  out.logT  = log(1.0 - alpha);
+  return out;
 }
 `;
 
@@ -177,6 +199,7 @@ fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
 const WGSL_COMPOSE = `
 @group(0) @binding(0) var accumTex : texture_2d<f32>;
 @group(0) @binding(1) var<uniform> bgColor : vec4<f32>;
+@group(0) @binding(2) var logTTex : texture_2d<f32>;
 
 @vertex
 fn vsCompose(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -188,9 +211,12 @@ fn vsCompose(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 fn fsCompose(@builtin(position) fragPos: vec4<f32>) -> @location(0) vec4<f32> {
   let coords = vec2<i32>(i32(fragPos.x), i32(fragPos.y));
   let accum    = textureLoad(accumTex, coords, 0);
+  let logT     = textureLoad(logTTex,  coords, 0).r;
   let w_fg     = accum.a;
   let C_fg     = select(vec3<f32>(0.0), accum.rgb / w_fg, w_fg > 0.0001);
-  let coverage = 1.0 - exp(-w_fg);
+  // T = prod(1-alpha_i); cleared to 0 → exp(0)=1 (fully transparent) before splats
+  let T        = exp(logT);
+  let coverage = 1.0 - T;
   let color    = mix(bgColor.rgb, C_fg, coverage);
   return vec4<f32>(color, 1.0);
 }
@@ -244,10 +270,8 @@ export class WebGPUSplatRenderer {
       size: UNIFORM_BUFFER_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    this.shBuffer = device.createBuffer({
-      size: 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
+    // SH stored as rgba16float texture (v5 format)
+    this.shTexture = null;  // created in initSHData()
     this.instanceBuffer = device.createBuffer({
       size: GEOM_FLOATS * 4,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -256,7 +280,7 @@ export class WebGPUSplatRenderer {
     this.splatBGL = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX, texture: { sampleType: "float" } },
       ],
     });
 
@@ -265,23 +289,34 @@ export class WebGPUSplatRenderer {
       vertex: {
         module: splatShader, entryPoint: "vsMain",
         buffers: [{
-          arrayStride: 48, stepMode: "instance",
+          arrayStride: 44, stepMode: "instance",  // v5: 11 floats = 44 bytes
           attributes: [
-            { shaderLocation: 0, offset:  0, format: "float32x4" },
-            { shaderLocation: 1, offset: 16, format: "float32x4" },
-            { shaderLocation: 2, offset: 32, format: "float32x4" },
+            { shaderLocation: 0, offset:  0, format: "float32x4" },  // pos+opacity
+            { shaderLocation: 1, offset: 16, format: "float32x4" },  // quat
+            { shaderLocation: 2, offset: 32, format: "float32x3" },  // scale only
           ],
         }],
       },
       fragment: {
         module: splatShader, entryPoint: "fsMain",
-        targets: [{
-          format: "rgba16float",
-          blend: {
-            color: { srcFactor: "one", dstFactor: "one", operation: "add" },
-            alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+        targets: [
+          {
+            format: "rgba16float",
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+            },
           },
-        }],
+          {
+            // log-transmittance: accumulate log(1-alpha) additively
+            // clear=0 → T=exp(0)=1; each splat contributes negative value → T→0
+            format: "r16float",
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+            },
+          },
+        ],
       },
       primitive: { topology: "triangle-list", cullMode: "none" },
     });
@@ -301,6 +336,7 @@ export class WebGPUSplatRenderer {
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
       ],
     });
 
@@ -315,15 +351,16 @@ export class WebGPUSplatRenderer {
     });
 
     this._rebuildSplatBindGroup();
-    // accumulation texture created on first resize()
+    // accumulation textures created on first resize()
   }
 
   _rebuildSplatBindGroup() {
+    if (!this.shTexture) return;  // defer until initSHData() provides the texture
     this.splatBindGroup = this.device.createBindGroup({
       layout: this.splatBGL,
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: { buffer: this.shBuffer } },
+        { binding: 1, resource: this.shTexture.createView() },
       ],
     });
   }
@@ -333,17 +370,25 @@ export class WebGPUSplatRenderer {
     this._accumWidth  = width;
     this._accumHeight = height;
     if (this.accumTexture) this.accumTexture.destroy();
+    if (this.logTTexture)  this.logTTexture.destroy();
     this.accumTexture = this.device.createTexture({
       size: [width, height],
       format: "rgba16float",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
+    this.logTTexture = this.device.createTexture({
+      size: [width, height],
+      format: "r16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
     this.accumView = this.accumTexture.createView();
+    this.logTView  = this.logTTexture.createView();
     this.composeBindGroup = this.device.createBindGroup({
       layout: this.composeBGL,
       entries: [
         { binding: 0, resource: this.accumView },
         { binding: 1, resource: { buffer: this.bgBuffer } },
+        { binding: 2, resource: this.logTView },
       ],
     });
   }
@@ -357,15 +402,30 @@ export class WebGPUSplatRenderer {
   }
 
   initSHData(shData) {
+    // shData: Uint16Array of raw float16 bits, N*48 elements (v5 format)
     const device = this.device;
-    if (!this.shBuffer || this.shBuffer.size !== shData.byteLength) {
-      if (this.shBuffer) this.shBuffer.destroy();
-      this.shBuffer = device.createBuffer({
-        size: shData.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-    }
-    device.queue.writeBuffer(this.shBuffer, 0, shData.buffer, shData.byteOffset, shData.byteLength);
+    const N = shData.length / 48;
+    const SH_TEX_WIDTH = 2048;
+    const totalTexels  = N * 12;
+    const height = Math.ceil(totalTexels / SH_TEX_WIDTH);
+
+    if (this.shTexture) this.shTexture.destroy();
+    this.shTexture = device.createTexture({
+      size: [SH_TEX_WIDTH, height],
+      format: "rgba16float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+
+    // Pad data to full rows
+    const padded = new Uint16Array(SH_TEX_WIDTH * height * 4);
+    padded.set(shData);
+
+    device.queue.writeTexture(
+      { texture: this.shTexture },
+      padded.buffer,
+      { offset: 0, bytesPerRow: SH_TEX_WIDTH * 8, rowsPerImage: height },
+      { width: SH_TEX_WIDTH, height },
+    );
     this._rebuildSplatBindGroup();
   }
 
@@ -387,6 +447,7 @@ export class WebGPUSplatRenderer {
   setRenderOptions(options) { this.renderOptions = options; }
 
   render(cameraState) {
+    if (!this.splatBindGroup) return;  // wait for initSHData()
     const device = this.device;
     const W = this.canvas.width;
     const H = this.canvas.height;
@@ -404,14 +465,22 @@ export class WebGPUSplatRenderer {
 
     const encoder = device.createCommandEncoder();
 
-    // ── Pass 1: accumulate splats ────────────────────────────────────────
+    // ── Pass 1: accumulate splats (MRT) ──────────────────────────────────
     const accumPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: this.accumView,
-        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
+      colorAttachments: [
+        {
+          view: this.accumView,
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: "clear",
+          storeOp: "store",
+        },
+        {
+          view: this.logTView,
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },  // clear to 0 → T=exp(0)=1
+          loadOp: "clear",
+          storeOp: "store",
+        },
+      ],
     });
     accumPass.setPipeline(this.splatPipeline);
     accumPass.setBindGroup(0, this.splatBindGroup);

@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "slug": "lego-mini",
   "title": "Mobile-GS Lego (_ms 60k fine-tune, SH3, 29.3 dB)",
   "binary": "lego-mini.bin",
