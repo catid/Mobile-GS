@@ -53,6 +53,15 @@ For export: use the PLY saved by `scene.save()`, which (after our fix) writes
 better web-viewer PSNR (36.5 dB) than the finetune PLY (24.9 dB DC-only) because the
 finetune MLP weights are not saved.
 
+### Fine-tune quality summary (lego_wb_finetune, 60k iter, _ms rasterizer)
+- Pretrain + SH3 + standard compositing:    36.17 dB (trained for this formula)
+- Pretrain + SH3 + _ms formula:            21.00 dB (not trained for _ms)
+- Fine-tuned + SH1 + _ms formula:          21.23 dB (phi MLP not in PLY, SH1 only)
+- Fine-tuned PLY has SH1 (9 f_rest fields) because `onedownSHdegree()` reduces degree
+  at fine-tune start and `net_enabled=True` replaces higher SH with MLP.
+- **Web viewer uses pretrain SH3 PLY** — keep until a SH3+_ms fine-tune is available.
+- Fine-tuned `.pth` checkpoint at `output/lego_wb_finetune/` has the full trained phi MLP.
+
 ### Web viewer
 - Serves `docs/` via GitHub Pages (`catid.github.io/Mobile-GS`)
 - Uses `docs/assets/scenes/lego-mini.{bin,json}` — currently pretrain 30k (36.17 dB, white bg)
@@ -64,6 +73,8 @@ finetune MLP weights are not saved.
 - Note: pretrain model was trained with standard compositing (`render_impori`), so _ms rendering
   may look slightly different from offline renders. The full fine-tuned model (trained with `_ms`)
   will match correctly. Binary format v4: geometry (12 f32/splat) + SH (48 f32/splat).
+- WebGPU compose pass uses `textureLoad` (not `textureSample`) to avoid unfilterable-float restriction.
+  Canvas context is acquired AFTER initialize() to preserve WebGL2 fallback if WebGPU init fails.
 
 ### SSH / push
 No GitHub SSH key on the dev machine (`id_ed25519_kuang2` is for `kuang2.lan` only).
