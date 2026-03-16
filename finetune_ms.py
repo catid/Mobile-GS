@@ -122,7 +122,8 @@ def training(dataset, opt, pipe, load_iter, model_out,
                         densify_grad_threshold, 0.005,
                         scene.cameras_extent, size_threshold)
 
-                if iteration % opt.opacity_reset_interval == 0:
+                if (iteration % opt.opacity_reset_interval == 0
+                        and iteration < densify_until):
                     gaussians.reset_opacity()
 
             # ── Evaluate ──────────────────────────────────────────────────────
