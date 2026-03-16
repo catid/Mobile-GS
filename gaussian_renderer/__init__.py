@@ -187,8 +187,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_xyz.shape[0], 1))
     dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
 
-
-    phi, opacity = pc.opacity_phi_nn(shs, scales, pc.get_xyz, dir_pp_normalized, rotations)
+    if pc.opacity_phi_nn is not None:
+        phi, opacity = pc.opacity_phi_nn(shs, scales, pc.get_xyz, dir_pp_normalized, rotations)
+    else:
+        phi = torch.zeros(pc.get_xyz.shape[0], 1, device="cuda")
+        opacity = pc.get_opacity
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     rendered_image, radii, *_ = rasterizer(
@@ -305,9 +308,11 @@ def render_imp(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tens
     dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_xyz.shape[0], 1))
     dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
 
-
-    phi, opacity = pc.opacity_phi_nn(shs, scales, pc.get_xyz, dir_pp_normalized, rotations)
-
+    if pc.opacity_phi_nn is not None:
+        phi, opacity = pc.opacity_phi_nn(shs, scales, pc.get_xyz, dir_pp_normalized, rotations)
+    else:
+        phi = torch.zeros(pc.get_xyz.shape[0], 1, device="cuda")
+        opacity = pc.get_opacity
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     rendered_image, radii, \
