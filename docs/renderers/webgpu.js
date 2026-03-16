@@ -176,27 +176,18 @@ fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
 // ---------------------------------------------------------------------------
 const WGSL_COMPOSE = `
 @group(0) @binding(0) var accumTex : texture_2d<f32>;
-@group(0) @binding(1) var accumSampler : sampler;
-@group(0) @binding(2) var<uniform> bgColor : vec4<f32>;
-
-struct ComposeOut {
-  @builtin(position) pos   : vec4<f32>,
-  @location(0)       uv    : vec2<f32>,
-};
+@group(0) @binding(1) var<uniform> bgColor : vec4<f32>;
 
 @vertex
-fn vsCompose(@builtin(vertex_index) vi: u32) -> ComposeOut {
+fn vsCompose(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
   let corners = array<vec2<f32>,3>(vec2(-1,-1), vec2(3,-1), vec2(-1,3));
-  let uvs     = array<vec2<f32>,3>(vec2(0,1),   vec2(2,1),  vec2(0,-1));
-  var out: ComposeOut;
-  out.pos = vec4<f32>(corners[vi], 0.0, 1.0);
-  out.uv  = uvs[vi];
-  return out;
+  return vec4<f32>(corners[vi], 0.0, 1.0);
 }
 
 @fragment
-fn fsCompose(in: ComposeOut) -> @location(0) vec4<f32> {
-  let accum    = textureSample(accumTex, accumSampler, in.uv);
+fn fsCompose(@builtin(position) fragPos: vec4<f32>) -> @location(0) vec4<f32> {
+  let coords = vec2<i32>(i32(fragPos.x), i32(fragPos.y));
+  let accum    = textureLoad(accumTex, coords, 0);
   let w_fg     = accum.a;
   let C_fg     = select(vec3<f32>(0.0), accum.rgb / w_fg, w_fg > 0.0001);
   let coverage = 1.0 - exp(-w_fg);
@@ -212,11 +203,16 @@ export class WebGPUSplatRenderer {
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) return null;
       const device  = await adapter.requestDevice();
-      const context = canvas.getContext("webgpu");
-      if (!context)  return null;
-      const format   = navigator.gpu.getPreferredCanvasFormat();
-      const renderer = new WebGPUSplatRenderer(canvas, scene, device, context, format);
+      const format  = navigator.gpu.getPreferredCanvasFormat();
+      // Delay canvas context acquisition until AFTER initialize() succeeds,
+      // so a failed init doesn't prevent WebGL2 from claiming the canvas.
+      const renderer = new WebGPUSplatRenderer(canvas, scene, device, format);
       await renderer.initialize();
+      // All init succeeded — now claim the canvas context
+      const context = canvas.getContext("webgpu");
+      if (!context) return null;
+      context.configure({ device, format, alphaMode: "opaque" });
+      renderer.context = context;
       return renderer;
     } catch (error) {
       console.warn("WebGPU renderer unavailable", error);
@@ -224,11 +220,11 @@ export class WebGPUSplatRenderer {
     }
   }
 
-  constructor(canvas, scene, device, context, format) {
+  constructor(canvas, scene, device, format) {
     this.canvas  = canvas;
     this.scene   = scene;
     this.device  = device;
-    this.context = context;
+    this.context = null;  // set by create() after initialize() succeeds
     this.format  = format;
     this.instanceCount = 0;
     this.renderOptions = { alphaScale: scene.render.alphaScale };
@@ -238,12 +234,8 @@ export class WebGPUSplatRenderer {
 
   async initialize() {
     const device = this.device;
-
-    this.context.configure({
-      device: device,
-      format: this.format,
-      alphaMode: "opaque",
-    });
+    // Note: canvas context is acquired AFTER initialize() by create() to avoid
+    // preventing WebGL2 fallback if something here fails.
 
     // ── Splat program ────────────────────────────────────────────────────
     const splatShader = device.createShaderModule({ code: WGSL_SPLAT });
@@ -305,13 +297,10 @@ export class WebGPUSplatRenderer {
     device.queue.writeBuffer(this.bgBuffer, 0,
       new Float32Array([bg[0], bg[1], bg[2], bg[3]]));
 
-    this.accumSampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
-
     this.composeBGL = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "non-filtering" } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     });
 
@@ -354,8 +343,7 @@ export class WebGPUSplatRenderer {
       layout: this.composeBGL,
       entries: [
         { binding: 0, resource: this.accumView },
-        { binding: 1, resource: this.accumSampler },
-        { binding: 2, resource: { buffer: this.bgBuffer } },
+        { binding: 1, resource: { buffer: this.bgBuffer } },
       ],
     });
   }
