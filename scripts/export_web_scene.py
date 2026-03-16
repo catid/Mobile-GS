@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.sh_utils import C0
+from utils.sh_utils import C0  # noqa: F401 (kept for potential fallback use)
 
 
 def sigmoid(values: np.ndarray) -> np.ndarray:
@@ -82,7 +82,23 @@ def main() -> None:
         ],
         axis=1,
     )
-    rgb = np.clip(sh_dc * C0 + 0.5, 0.0, 1.0)
+
+    # Load SH rest coefficients if available (45 = 15 per channel × 3 channels for SH3)
+    rest_props = [p.name for p in ply.properties if p.name.startswith("f_rest_")]
+    n_rest = len(rest_props)
+    if n_rest >= 45:
+        rest = np.stack(
+            [np.asarray(ply[f"f_rest_{i}"], dtype=np.float32) for i in range(45)],
+            axis=1,
+        )  # N, 45: R_1..R_15, G_1..G_15, B_1..B_15
+    else:
+        rest = np.zeros((len(sh_dc), 45), dtype=np.float32)
+
+    # SH per channel: [dc, rest_0..14] = 16 coefficients
+    sh_r = np.concatenate([sh_dc[:, 0:1], rest[:, 0:15]], axis=1)   # N, 16
+    sh_g = np.concatenate([sh_dc[:, 1:2], rest[:, 15:30]], axis=1)  # N, 16
+    sh_b = np.concatenate([sh_dc[:, 2:3], rest[:, 30:45]], axis=1)  # N, 16
+
     opacity = sigmoid(np.asarray(ply["opacity"], dtype=np.float32))
 
     # Quaternion: PLY stores (rot_0=qw, rot_1=qx, rot_2=qy, rot_3=qz)
@@ -106,7 +122,9 @@ def main() -> None:
         keep = np.argpartition(importance, -args.max_splats)[-args.max_splats:]
         keep = keep[np.argsort(importance[keep])[::-1]]
         xyz     = xyz[keep]
-        rgb     = rgb[keep]
+        sh_r    = sh_r[keep]
+        sh_g    = sh_g[keep]
+        sh_b    = sh_b[keep]
         opacity = opacity[keep]
         quat    = quat[keep]
         scale   = scale[keep]
@@ -122,29 +140,31 @@ def main() -> None:
     binary_name  = f"{args.slug}.bin"
     manifest_name = f"{args.slug}.json"
 
-    # Binary layout per splat: 16 × float32 = 64 bytes (vec4-aligned)
-    #   [0-2]  xyz position
-    #   [3]    opacity (sigmoid-activated)
-    #   [4-7]  quaternion (qw, qx, qy, qz) normalised
-    #   [8-10] scale (exp-activated sx, sy, sz)
-    #   [11]   padding
-    #   [12-14] rgb colour (DC-SH activated)
-    #   [15]   padding
-    interleaved = np.zeros((n, 16), dtype=np.float32)
-    interleaved[:, 0:3]  = xyz
-    interleaved[:, 3]    = opacity
-    interleaved[:, 4:8]  = quat         # qw qx qy qz
-    interleaved[:, 8:11] = scale
-    interleaved[:, 11]   = 0.0
-    interleaved[:, 12:15] = rgb
-    interleaved[:, 15]   = 0.0
+    # Binary layout per splat: 60 × float32 = 240 bytes (SH3 format)
+    #   [0-2]   xyz position
+    #   [3]     opacity (sigmoid-activated)
+    #   [4-7]   quaternion (qw, qx, qy, qz) normalised
+    #   [8-10]  scale (exp-activated sx, sy, sz)
+    #   [11]    padding
+    #   [12-27] sh_r[0..15] = [f_dc_r, f_rest_r_0..14]  (raw SH coefficients)
+    #   [28-43] sh_g[0..15] = [f_dc_g, f_rest_g_0..14]
+    #   [44-59] sh_b[0..15] = [f_dc_b, f_rest_b_0..14]
+    interleaved = np.zeros((n, 60), dtype=np.float32)
+    interleaved[:, 0:3]   = xyz
+    interleaved[:, 3]     = opacity
+    interleaved[:, 4:8]   = quat         # qw qx qy qz
+    interleaved[:, 8:11]  = scale
+    interleaved[:, 11]    = 0.0
+    interleaved[:, 12:28] = sh_r
+    interleaved[:, 28:44] = sh_g
+    interleaved[:, 44:60] = sh_b
     interleaved.tofile(output_dir / binary_name)
 
     cameras = load_cameras(args.cameras) if args.cameras else []
     camera_defaults = compute_camera_defaults(cameras, center, scene_radius)
 
     manifest = {
-        "version": 2,
+        "version": 3,
         "slug": args.slug,
         "title": args.title,
         "binary": binary_name,

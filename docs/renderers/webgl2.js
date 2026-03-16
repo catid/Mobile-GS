@@ -1,23 +1,40 @@
-// Instance buffer layout (64 bytes = 16 floats per splat):
-//   offset  0 : vec4  posOpacity  (x, y, z, opacity)
-//   offset 16 : vec4  quat        (qw, qx, qy, qz)
-//   offset 32 : vec4  scalePad    (sx, sy, sz, 0)
-//   offset 48 : vec4  colorPad    (r,  g,  b,  0)
-const FLOATS_PER_SPLAT = 16;
+// Instance buffer layout (60 floats = 240 bytes per splat, SH3 format):
+//   offset   0 : vec4  posOpacity  (x, y, z, opacity)
+//   offset  16 : vec4  quat        (qw, qx, qy, qz)
+//   offset  32 : vec4  scalePad    (sx, sy, sz, 0)
+//   offset  48 : vec4  sh_r[0..3]  (dc_r, rest_r_0..2)
+//   offset  64 : vec4  sh_r[4..7]
+//   offset  80 : vec4  sh_r[8..11]
+//   offset  96 : vec4  sh_r[12..15]
+//   offset 112 : vec4  sh_g[0..3]  ... (same pattern)
+//   offset 176 : vec4  sh_b[0..3]  ... (same pattern)
+const FLOATS_PER_SPLAT = 60;
 
 const VERTEX_SOURCE = `#version 300 es
 precision highp float;
 
-layout(location = 0) in vec4 aPosOpacity;   // x y z opacity
-layout(location = 1) in vec4 aQuat;          // qw qx qy qz
-layout(location = 2) in vec4 aScalePad;      // sx sy sz 0
-layout(location = 3) in vec4 aColorPad;      // r  g  b  0
+layout(location =  0) in vec4 aPosOpacity;   // x y z opacity
+layout(location =  1) in vec4 aQuat;          // qw qx qy qz
+layout(location =  2) in vec4 aScalePad;      // sx sy sz 0
+layout(location =  3) in vec4 aSH_R0;         // sh_r[0..3]
+layout(location =  4) in vec4 aSH_R1;
+layout(location =  5) in vec4 aSH_R2;
+layout(location =  6) in vec4 aSH_R3;
+layout(location =  7) in vec4 aSH_G0;         // sh_g[0..3]
+layout(location =  8) in vec4 aSH_G1;
+layout(location =  9) in vec4 aSH_G2;
+layout(location = 10) in vec4 aSH_G3;
+layout(location = 11) in vec4 aSH_B0;         // sh_b[0..3]
+layout(location = 12) in vec4 aSH_B1;
+layout(location = 13) in vec4 aSH_B2;
+layout(location = 14) in vec4 aSH_B3;
 
 uniform mat4 uViewProj;
 uniform mat4 uView;
 uniform float uFocal;
 uniform float uWidth;
 uniform float uHeight;
+uniform vec3 uEye;
 
 out vec3 vConic;
 out vec2 vCenterPix;  // in gl_FragCoord space: y=0 at BOTTOM
@@ -42,11 +59,47 @@ mat3 quatToMat(vec4 q) {
   );
 }
 
+// Evaluate SH degree-3 (16 coefficients per channel) given unit view direction.
+vec3 evalSH3(vec3 dir,
+    vec4 r0, vec4 r1, vec4 r2, vec4 r3,
+    vec4 g0, vec4 g1, vec4 g2, vec4 g3,
+    vec4 b0, vec4 b1, vec4 b2, vec4 b3) {
+  float x = dir.x, y = dir.y, z = dir.z;
+
+  // L0
+  vec3 col = vec3(r0.x, g0.x, b0.x) * 0.28209479177387814;
+
+  // L1
+  float c1 = 0.4886025119029199;
+  col += vec3(r0.y, g0.y, b0.y) * (c1 * (-y));
+  col += vec3(r0.z, g0.z, b0.z) * (c1 * z);
+  col += vec3(r0.w, g0.w, b0.w) * (c1 * (-x));
+
+  // L2
+  float xx = x*x, yy = y*y, zz = z*z;
+  float xy = x*y, yz = y*z, xz = x*z;
+  col += vec3(r1.x, g1.x, b1.x) * ( 1.0925484305920792 * xy);
+  col += vec3(r1.y, g1.y, b1.y) * (-1.0925484305920792 * yz);
+  col += vec3(r1.z, g1.z, b1.z) * ( 0.31539156525252005 * (2.0*zz - xx - yy));
+  col += vec3(r1.w, g1.w, b1.w) * (-1.0925484305920792 * xz);
+  col += vec3(r2.x, g2.x, b2.x) * ( 0.5462742152960396 * (xx - yy));
+
+  // L3
+  col += vec3(r2.y, g2.y, b2.y) * (-0.5900435899266435 * y * (3.0*xx - yy));
+  col += vec3(r2.z, g2.z, b2.z) * ( 2.890611442640554  * xy * z);
+  col += vec3(r2.w, g2.w, b2.w) * (-0.4570457994644658 * y * (4.0*zz - xx - yy));
+  col += vec3(r3.x, g3.x, b3.x) * ( 0.3731763325901154 * z * (2.0*zz - 3.0*xx - 3.0*yy));
+  col += vec3(r3.y, g3.y, b3.y) * (-0.4570457994644658 * x * (4.0*zz - xx - yy));
+  col += vec3(r3.z, g3.z, b3.z) * ( 1.445305721320277  * z * (xx - yy));
+  col += vec3(r3.w, g3.w, b3.w) * (-0.5900435899266435 * x * (xx - 3.0*yy));
+
+  return max(col + 0.5, vec3(0.0));
+}
+
 void main() {
   vec3  pos     = aPosOpacity.xyz;
   float opacity = aPosOpacity.w;
   vec3  scale   = aScalePad.xyz;
-  vec3  color   = aColorPad.rgb;
 
   // ---- View-space position -----------------------------------------------
   vec4  p_view4 = uView * vec4(pos, 1.0);
@@ -114,7 +167,14 @@ void main() {
                      p_clip.z * inv_pw, 1.0);
   vConic     = conic;
   vCenterPix = vec2(cx, cy_gl);
-  vColor     = vec4(color, opacity);
+
+  // ---- SH3 color evaluation (view-dependent) -----------------------------
+  vec3 dir = normalize(pos - uEye);
+  vec3 rgb = evalSH3(dir,
+    aSH_R0, aSH_R1, aSH_R2, aSH_R3,
+    aSH_G0, aSH_G1, aSH_G2, aSH_G3,
+    aSH_B0, aSH_B1, aSH_B2, aSH_B3);
+  vColor = vec4(rgb, opacity);
 }
 `;
 
@@ -202,6 +262,7 @@ export class WebGL2SplatRenderer {
       focal:      gl.getUniformLocation(this.program, "uFocal"),
       width:      gl.getUniformLocation(this.program, "uWidth"),
       height:     gl.getUniformLocation(this.program, "uHeight"),
+      eye:        gl.getUniformLocation(this.program, "uEye"),
       alphaScale: gl.getUniformLocation(this.program, "uAlphaScale"),
     };
 
@@ -210,23 +271,32 @@ export class WebGL2SplatRenderer {
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
 
-    const stride = FLOATS_PER_SPLAT * 4;   // 64 bytes
-    // attr 0: posOpacity  (offset 0)
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 4, gl.FLOAT, false, stride, 0);
-    gl.vertexAttribDivisor(0, 1);
-    // attr 1: quat  (offset 16)
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 16);
-    gl.vertexAttribDivisor(1, 1);
-    // attr 2: scalePad  (offset 32)
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 32);
-    gl.vertexAttribDivisor(2, 1);
-    // attr 3: colorPad  (offset 48)
-    gl.enableVertexAttribArray(3);
-    gl.vertexAttribPointer(3, 4, gl.FLOAT, false, stride, 48);
-    gl.vertexAttribDivisor(3, 1);
+    const stride = FLOATS_PER_SPLAT * 4;   // 240 bytes
+
+    // attrs 0-2: posOpacity, quat, scalePad (offsets 0, 16, 32)
+    for (let i = 0; i < 3; i++) {
+      gl.enableVertexAttribArray(i);
+      gl.vertexAttribPointer(i, 4, gl.FLOAT, false, stride, i * 16);
+      gl.vertexAttribDivisor(i, 1);
+    }
+    // attrs 3-6: sh_r (offsets 48, 64, 80, 96)
+    for (let i = 0; i < 4; i++) {
+      gl.enableVertexAttribArray(3 + i);
+      gl.vertexAttribPointer(3 + i, 4, gl.FLOAT, false, stride, 48 + i * 16);
+      gl.vertexAttribDivisor(3 + i, 1);
+    }
+    // attrs 7-10: sh_g (offsets 112, 128, 144, 160)
+    for (let i = 0; i < 4; i++) {
+      gl.enableVertexAttribArray(7 + i);
+      gl.vertexAttribPointer(7 + i, 4, gl.FLOAT, false, stride, 112 + i * 16);
+      gl.vertexAttribDivisor(7 + i, 1);
+    }
+    // attrs 11-14: sh_b (offsets 176, 192, 208, 224)
+    for (let i = 0; i < 4; i++) {
+      gl.enableVertexAttribArray(11 + i);
+      gl.vertexAttribPointer(11 + i, 4, gl.FLOAT, false, stride, 176 + i * 16);
+      gl.vertexAttribDivisor(11 + i, 1);
+    }
 
     gl.bindVertexArray(null);
 
@@ -254,7 +324,6 @@ export class WebGL2SplatRenderer {
   updateSceneData(interleaved) {
     this.instanceCount = interleaved.length / FLOATS_PER_SPLAT;
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.instanceBuffer);
-    // bufferSubData reuses existing GPU allocation; bufferData re-allocates.
     if (this._instanceBufferSize === interleaved.byteLength) {
       this.gl.bufferSubData(this.gl.ARRAY_BUFFER, 0, interleaved);
     } else {
@@ -278,6 +347,7 @@ export class WebGL2SplatRenderer {
     gl.uniform1f(this.locations.focal,      cameraState.focal);
     gl.uniform1f(this.locations.width,      this.canvas.width);
     gl.uniform1f(this.locations.height,     this.canvas.height);
+    gl.uniform3fv(this.locations.eye,       cameraState.eye);
     gl.uniform1f(this.locations.alphaScale, this.renderOptions.alphaScale);
 
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);

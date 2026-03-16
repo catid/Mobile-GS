@@ -1,7 +1,7 @@
 {
-  "version": 2,
+  "version": 3,
   "slug": "lego-mini",
-  "title": "Mobile-GS Lego (pretrain 30k)",
+  "title": "Mobile-GS Lego (pretrain 30k, SH3)",
   "binary": "lego-mini.bin",
   "splatCount": 222899,
   "bounds": {

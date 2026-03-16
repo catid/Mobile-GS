@@ -11,8 +11,8 @@ const alphaControl = document.querySelector("#alpha-control");
 const autorotateControl = document.querySelector("#autorotate-control");
 const fpsCounter = document.querySelector("#fps-counter");
 
-// Each splat is 16 floats (64 bytes): posOpacity | quat | scalePad | colorPad
-const FLOATS_PER_SPLAT = 16;
+// Each splat is 60 floats (240 bytes): posOpacity | quat | scalePad | sh_r[16] | sh_g[16] | sh_b[16]
+const FLOATS_PER_SPLAT = 60;
 
 // How long (ms) to wait before requesting another sort when the camera is still.
 const SORT_INTERVAL_IDLE_MS = 200;

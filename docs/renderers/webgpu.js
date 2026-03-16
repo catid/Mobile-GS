@@ -1,16 +1,22 @@
-// Uniform buffer layout (160 bytes = 40 floats):
+// Uniform buffer layout (176 bytes = 44 floats):
 //   offset   0 : mat4x4  viewProj
 //   offset  64 : mat4x4  view
 //   offset 128 : vec4    viewport  (width, height, focal, 0)
 //   offset 144 : vec4    params    (alphaScale, 0, 0, 0)
-const UNIFORM_BUFFER_SIZE = 160;
+//   offset 160 : vec4    eye       (ex, ey, ez, 0)
+const UNIFORM_BUFFER_SIZE = 176;
 
-// Instance buffer layout (64 bytes = 16 floats per splat):
-//   offset  0 : vec4  posOpacity  (x, y, z, opacity)
-//   offset 16 : vec4  quat        (qw, qx, qy, qz)
-//   offset 32 : vec4  scalePad    (sx, sy, sz, 0)
-//   offset 48 : vec4  colorPad    (r, g, b, 0)
-const FLOATS_PER_SPLAT = 16;
+// Instance buffer layout (60 floats = 240 bytes per splat, SH3 format):
+//   offset   0 : vec4  posOpacity  (x, y, z, opacity)
+//   offset  16 : vec4  quat        (qw, qx, qy, qz)
+//   offset  32 : vec4  scalePad    (sx, sy, sz, 0)
+//   offset  48 : vec4  sh_r[0..3]  (dc_r, rest_r_0..2)
+//   offset  64 : vec4  sh_r[4..7]
+//   offset  80 : vec4  sh_r[8..11]
+//   offset  96 : vec4  sh_r[12..15]
+//   offset 112 : vec4  sh_g[0..3]  ... (same pattern)
+//   offset 176 : vec4  sh_b[0..3]  ... (same pattern)
+const FLOATS_PER_SPLAT = 60;
 
 const WGSL_SHADER = `
 struct CameraUniforms {
@@ -18,6 +24,7 @@ struct CameraUniforms {
   view     : mat4x4<f32>,
   viewport : vec4<f32>,   // width, height, focal, 0
   params   : vec4<f32>,   // alphaScale, 0, 0, 0
+  eye      : vec4<f32>,   // camera world-space position, 0
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -48,20 +55,70 @@ fn quatToMat(q: vec4<f32>) -> mat3x3<f32> {
   );
 }
 
+// Evaluate SH degree-3 (16 coefficients per channel) given unit view direction.
+// r0..r3 hold sh_r[0..3], sh_r[4..7], sh_r[8..11], sh_r[12..15] respectively.
+fn evalSH3(
+    dir: vec3<f32>,
+    r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32>, r3: vec4<f32>,
+    g0: vec4<f32>, g1: vec4<f32>, g2: vec4<f32>, g3: vec4<f32>,
+    b0: vec4<f32>, b1: vec4<f32>, b2: vec4<f32>, b3: vec4<f32>,
+) -> vec3<f32> {
+    let x = dir.x; let y = dir.y; let z = dir.z;
+
+    // L0
+    var col = vec3<f32>(r0.x, g0.x, b0.x) * 0.28209479177387814;
+
+    // L1
+    let c1 = 0.4886025119029199;
+    col += vec3<f32>(r0.y, g0.y, b0.y) * (c1 * (-y));
+    col += vec3<f32>(r0.z, g0.z, b0.z) * (c1 * z);
+    col += vec3<f32>(r0.w, g0.w, b0.w) * (c1 * (-x));
+
+    // L2
+    let xx = x*x; let yy = y*y; let zz = z*z;
+    let xy = x*y; let yz = y*z; let xz = x*z;
+    col += vec3<f32>(r1.x, g1.x, b1.x) * ( 1.0925484305920792 * xy);
+    col += vec3<f32>(r1.y, g1.y, b1.y) * (-1.0925484305920792 * yz);
+    col += vec3<f32>(r1.z, g1.z, b1.z) * ( 0.31539156525252005 * (2.0*zz - xx - yy));
+    col += vec3<f32>(r1.w, g1.w, b1.w) * (-1.0925484305920792 * xz);
+    col += vec3<f32>(r2.x, g2.x, b2.x) * ( 0.5462742152960396 * (xx - yy));
+
+    // L3
+    col += vec3<f32>(r2.y, g2.y, b2.y) * (-0.5900435899266435 * y * (3.0*xx - yy));
+    col += vec3<f32>(r2.z, g2.z, b2.z) * ( 2.890611442640554  * xy * z);
+    col += vec3<f32>(r2.w, g2.w, b2.w) * (-0.4570457994644658 * y * (4.0*zz - xx - yy));
+    col += vec3<f32>(r3.x, g3.x, b3.x) * ( 0.3731763325901154 * z * (2.0*zz - 3.0*xx - 3.0*yy));
+    col += vec3<f32>(r3.y, g3.y, b3.y) * (-0.4570457994644658 * x * (4.0*zz - xx - yy));
+    col += vec3<f32>(r3.z, g3.z, b3.z) * ( 1.445305721320277  * z * (xx - yy));
+    col += vec3<f32>(r3.w, g3.w, b3.w) * (-0.5900435899266435 * x * (xx - 3.0*yy));
+
+    return max(col + 0.5, vec3<f32>(0.0));
+}
+
 @vertex
 fn vsMain(
   @builtin(vertex_index) vertexIndex : u32,
-  @location(0) posOpacity : vec4<f32>,  // x y z opacity
-  @location(1) quat       : vec4<f32>,  // qw qx qy qz
-  @location(2) scalePad   : vec4<f32>,  // sx sy sz 0
-  @location(3) colorPad   : vec4<f32>,  // r  g  b  0
+  @location(0)  posOpacity : vec4<f32>,   // x y z opacity
+  @location(1)  quat       : vec4<f32>,   // qw qx qy qz
+  @location(2)  scalePad   : vec4<f32>,   // sx sy sz 0
+  @location(3)  sh_r0 : vec4<f32>,
+  @location(4)  sh_r1 : vec4<f32>,
+  @location(5)  sh_r2 : vec4<f32>,
+  @location(6)  sh_r3 : vec4<f32>,
+  @location(7)  sh_g0 : vec4<f32>,
+  @location(8)  sh_g1 : vec4<f32>,
+  @location(9)  sh_g2 : vec4<f32>,
+  @location(10) sh_g3 : vec4<f32>,
+  @location(11) sh_b0 : vec4<f32>,
+  @location(12) sh_b1 : vec4<f32>,
+  @location(13) sh_b2 : vec4<f32>,
+  @location(14) sh_b3 : vec4<f32>,
 ) -> VertexOutput {
   var out: VertexOutput;
 
   let pos     = posOpacity.xyz;
   let opacity = posOpacity.w;
   let scale   = scalePad.xyz;
-  let color   = colorPad.rgb;
 
   // ---- View-space position -----------------------------------------------
   let p_view = camera.view * vec4<f32>(pos, 1.0);
@@ -72,7 +129,6 @@ fn vsMain(
   }
 
   // ---- View-space covariance  Sigma_v = M * M^T  where M = W * R * S -----
-  // W = upper-left 3×3 of view matrix (world → view rotation)
   let W = mat3x3<f32>(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
   let R = quatToMat(quat);
   let M = mat3x3<f32>(
@@ -94,7 +150,7 @@ fn vsMain(
   // ---- 2D screen-space covariance  Sigma_2D = J Sv J^T ------------------
   let SvJ0  = Sv * J0;
   let SvJ1  = Sv * J1;
-  var cov00 = dot(J0, SvJ0) + 0.3;  // low-frequency regularisation
+  var cov00 = dot(J0, SvJ0) + 0.3;
   let cov01 = dot(J0, SvJ1);
   var cov11 = dot(J1, SvJ1) + 0.3;
 
@@ -132,7 +188,14 @@ fn vsMain(
                              p_clip.z * inv_pw, 1.0);
   out.conic     = conic;
   out.centerPix = vec2<f32>(cx, cy);
-  out.color     = vec4<f32>(color, opacity);
+
+  // ---- SH3 color evaluation (view-dependent) -----------------------------
+  let dir = normalize(pos - camera.eye.xyz);
+  let rgb = evalSH3(dir,
+    sh_r0, sh_r1, sh_r2, sh_r3,
+    sh_g0, sh_g1, sh_g2, sh_g3,
+    sh_b0, sh_b1, sh_b2, sh_b3);
+  out.color = vec4<f32>(rgb, opacity);
   return out;
 }
 
@@ -204,7 +267,7 @@ export class WebGPUSplatRenderer {
     });
 
     this.instanceBuffer = this.device.createBuffer({
-      size: 64,   // minimum allocation; will be replaced on first data upload
+      size: 240,   // minimum allocation; will be replaced on first data upload
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
 
@@ -227,13 +290,24 @@ export class WebGPUSplatRenderer {
         entryPoint: "vsMain",
         buffers: [
           {
-            arrayStride: FLOATS_PER_SPLAT * 4,   // 64 bytes per splat
+            arrayStride: FLOATS_PER_SPLAT * 4,   // 240 bytes per splat
             stepMode: "instance",
             attributes: [
-              { shaderLocation: 0, offset:  0, format: "float32x4" },  // posOpacity
-              { shaderLocation: 1, offset: 16, format: "float32x4" },  // quat
-              { shaderLocation: 2, offset: 32, format: "float32x4" },  // scalePad
-              { shaderLocation: 3, offset: 48, format: "float32x4" },  // colorPad
+              { shaderLocation:  0, offset:   0, format: "float32x4" },  // posOpacity
+              { shaderLocation:  1, offset:  16, format: "float32x4" },  // quat
+              { shaderLocation:  2, offset:  32, format: "float32x4" },  // scalePad
+              { shaderLocation:  3, offset:  48, format: "float32x4" },  // sh_r[0..3]
+              { shaderLocation:  4, offset:  64, format: "float32x4" },  // sh_r[4..7]
+              { shaderLocation:  5, offset:  80, format: "float32x4" },  // sh_r[8..11]
+              { shaderLocation:  6, offset:  96, format: "float32x4" },  // sh_r[12..15]
+              { shaderLocation:  7, offset: 112, format: "float32x4" },  // sh_g[0..3]
+              { shaderLocation:  8, offset: 128, format: "float32x4" },  // sh_g[4..7]
+              { shaderLocation:  9, offset: 144, format: "float32x4" },  // sh_g[8..11]
+              { shaderLocation: 10, offset: 160, format: "float32x4" },  // sh_g[12..15]
+              { shaderLocation: 11, offset: 176, format: "float32x4" },  // sh_b[0..3]
+              { shaderLocation: 12, offset: 192, format: "float32x4" },  // sh_b[4..7]
+              { shaderLocation: 13, offset: 208, format: "float32x4" },  // sh_b[8..11]
+              { shaderLocation: 14, offset: 224, format: "float32x4" },  // sh_b[12..15]
             ],
           },
         ],
@@ -312,8 +386,8 @@ export class WebGPUSplatRenderer {
     const H = this.canvas.height;
     const focal = cameraState.focal;
 
-    // Pack uniforms: viewProj(16) + view(16) + viewport(4) + params(4) = 40 floats
-    const packed = new Float32Array(40);
+    // Pack uniforms: viewProj(16) + view(16) + viewport(4) + params(4) + eye(4) = 44 floats
+    const packed = new Float32Array(44);
     packed.set(cameraState.viewProjection, 0);
     packed.set(cameraState.view, 16);
     packed[32] = W;
@@ -322,6 +396,10 @@ export class WebGPUSplatRenderer {
     packed[35] = 0.0;
     packed[36] = this.renderOptions.alphaScale;
     // packed[37..39] = 0 (default)
+    packed[40] = cameraState.eye[0];
+    packed[41] = cameraState.eye[1];
+    packed[42] = cameraState.eye[2];
+    packed[43] = 0.0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, packed.buffer);
 
     const encoder = this.device.createCommandEncoder();
