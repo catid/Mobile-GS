@@ -1,3 +1,8 @@
+// Mobile-GS two-pass WebGPU renderer — matches _ms CUDA blending formula (phi=0):
+//   Pass 1: accumulate (color*alpha_w, alpha_w) additively into rgba16float texture
+//   Pass 2: compose — C/w_fg * coverage + bg*(1-coverage), coverage=1-exp(-w_fg)
+//   weight = exp(min(max_scale / depth, 20))
+//
 // Uniform buffer layout (176 bytes = 44 floats):
 //   offset   0 : mat4x4  viewProj
 //   offset  64 : mat4x4  view
@@ -12,7 +17,10 @@ const UNIFORM_BUFFER_SIZE = 176;
 //   offset 32 : vec4  scaleIdx    (sx, sy, sz, float(originalIndex))
 const GEOM_FLOATS = 12;
 
-const WGSL_SHADER = `
+// ---------------------------------------------------------------------------
+// Pass 1: splat accumulation shader
+// ---------------------------------------------------------------------------
+const WGSL_SPLAT = `
 struct CameraUniforms {
   viewProj : mat4x4<f32>,
   view     : mat4x4<f32>,
@@ -28,7 +36,8 @@ struct VertexOutput {
   @builtin(position) position  : vec4<f32>,
   @location(0)       conic     : vec3<f32>,
   @location(1)       centerPix : vec2<f32>,
-  @location(2)       color     : vec4<f32>,
+  @location(2)       color     : vec4<f32>,  // rgb=SH color, a=opacity
+  @location(3)       weight    : f32,         // exp(min(max_scale/depth, 20))
 };
 
 const quad = array<vec2<f32>, 6>(
@@ -144,6 +153,9 @@ fn vsMain(
   let sh_b2 = getSH(origIdx, 40u); let sh_b3 = getSH(origIdx, 44u);
   let rgb = evalSH3(dir, sh_r0,sh_r1,sh_r2,sh_r3, sh_g0,sh_g1,sh_g2,sh_g3, sh_b0,sh_b1,sh_b2,sh_b3);
   out.color = vec4<f32>(rgb, opacity);
+
+  let max_scale = max(scale.x, max(scale.y, scale.z));
+  out.weight = exp(min(max_scale / fwd, 20.0));
   return out;
 }
 
@@ -152,30 +164,57 @@ fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
   let d = in.position.xy - in.centerPix;
   let power = 0.5*(in.conic.x*d.x*d.x + 2.0*in.conic.y*d.x*d.y + in.conic.z*d.y*d.y);
   if (power > 8.0) { discard; }
-  let alpha = in.color.a * exp(-power) * camera.params.x;
-  if (alpha < 0.00392) { discard; }
-  return vec4<f32>(in.color.rgb * alpha, alpha);
+  let alpha_w = in.color.a * exp(-power) * camera.params.x * in.weight;
+  if (alpha_w < 0.00001) { discard; }
+  // Additive accumulation: rgb accumulates color*alpha_w, a accumulates alpha_w
+  return vec4<f32>(in.color.rgb * alpha_w, alpha_w);
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Pass 2: composition shader
+// ---------------------------------------------------------------------------
+const WGSL_COMPOSE = `
+@group(0) @binding(0) var accumTex : texture_2d<f32>;
+@group(0) @binding(1) var accumSampler : sampler;
+@group(0) @binding(2) var<uniform> bgColor : vec4<f32>;
+
+struct ComposeOut {
+  @builtin(position) pos   : vec4<f32>,
+  @location(0)       uv    : vec2<f32>,
+};
+
+@vertex
+fn vsCompose(@builtin(vertex_index) vi: u32) -> ComposeOut {
+  let corners = array<vec2<f32>,3>(vec2(-1,-1), vec2(3,-1), vec2(-1,3));
+  let uvs     = array<vec2<f32>,3>(vec2(0,1),   vec2(2,1),  vec2(0,-1));
+  var out: ComposeOut;
+  out.pos = vec4<f32>(corners[vi], 0.0, 1.0);
+  out.uv  = uvs[vi];
+  return out;
+}
+
+@fragment
+fn fsCompose(in: ComposeOut) -> @location(0) vec4<f32> {
+  let accum    = textureSample(accumTex, accumSampler, in.uv);
+  let w_fg     = accum.a;
+  let C_fg     = select(vec3<f32>(0.0), accum.rgb / w_fg, w_fg > 0.0001);
+  let coverage = 1.0 - exp(-w_fg);
+  let color    = mix(bgColor.rgb, C_fg, coverage);
+  return vec4<f32>(color, 1.0);
 }
 `;
 
 export class WebGPUSplatRenderer {
   static async create(canvas, scene) {
-    if (!navigator.gpu) {
-      return null;
-    }
-
+    if (!navigator.gpu) return null;
     try {
       const adapter = await navigator.gpu.requestAdapter();
-      if (!adapter) {
-        return null;
-      }
-
-      const device = await adapter.requestDevice();
+      if (!adapter) return null;
+      const device  = await adapter.requestDevice();
       const context = canvas.getContext("webgpu");
-      if (!context) {
-        return null;
-      }
-      const format = navigator.gpu.getPreferredCanvasFormat();
+      if (!context)  return null;
+      const format   = navigator.gpu.getPreferredCanvasFormat();
       const renderer = new WebGPUSplatRenderer(canvas, scene, device, context, format);
       await renderer.initialize();
       return renderer;
@@ -186,108 +225,113 @@ export class WebGPUSplatRenderer {
   }
 
   constructor(canvas, scene, device, context, format) {
-    this.canvas = canvas;
-    this.scene = scene;
-    this.device = device;
+    this.canvas  = canvas;
+    this.scene   = scene;
+    this.device  = device;
     this.context = context;
-    this.format = format;
+    this.format  = format;
     this.instanceCount = 0;
-    this.renderOptions = {
-      alphaScale: scene.render.alphaScale,
-    };
+    this.renderOptions = { alphaScale: scene.render.alphaScale };
+    this._accumWidth  = 0;
+    this._accumHeight = 0;
   }
 
   async initialize() {
+    const device = this.device;
+
     this.context.configure({
-      device: this.device,
+      device: device,
       format: this.format,
-      alphaMode: "premultiplied",
+      alphaMode: "opaque",
     });
 
-    const shader = this.device.createShaderModule({ code: WGSL_SHADER });
+    // ── Splat program ────────────────────────────────────────────────────
+    const splatShader = device.createShaderModule({ code: WGSL_SPLAT });
 
-    this.uniformBuffer = this.device.createBuffer({
+    this.uniformBuffer = device.createBuffer({
       size: UNIFORM_BUFFER_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-
-    // Placeholder SH storage buffer (1 element); replaced by initSHData()
-    this.shBuffer = this.device.createBuffer({
+    this.shBuffer = device.createBuffer({
       size: 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-
-    this.instanceBuffer = this.device.createBuffer({
-      size: GEOM_FLOATS * 4,   // minimum allocation; will be replaced on first data upload
+    this.instanceBuffer = device.createBuffer({
+      size: GEOM_FLOATS * 4,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
 
-    this.bindGroupLayout = this.device.createBindGroupLayout({
+    this.splatBGL = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
       ],
     });
 
-    this.pipeline = this.device.createRenderPipeline({
-      layout: this.device.createPipelineLayout({
-        bindGroupLayouts: [this.bindGroupLayout],
-      }),
+    this.splatPipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.splatBGL] }),
       vertex: {
-        module: shader,
-        entryPoint: "vsMain",
-        buffers: [
-          {
-            arrayStride: 48,   // 12 floats * 4 bytes = 48 bytes per splat
-            stepMode: "instance",
-            attributes: [
-              { shaderLocation: 0, offset:  0, format: "float32x4" },  // posOpacity
-              { shaderLocation: 1, offset: 16, format: "float32x4" },  // quat
-              { shaderLocation: 2, offset: 32, format: "float32x4" },  // scaleIdx
-            ],
-          },
-        ],
+        module: splatShader, entryPoint: "vsMain",
+        buffers: [{
+          arrayStride: 48, stepMode: "instance",
+          attributes: [
+            { shaderLocation: 0, offset:  0, format: "float32x4" },
+            { shaderLocation: 1, offset: 16, format: "float32x4" },
+            { shaderLocation: 2, offset: 32, format: "float32x4" },
+          ],
+        }],
       },
       fragment: {
-        module: shader,
-        entryPoint: "fsMain",
-        targets: [
-          {
-            format: this.format,
-            blend: {
-              color: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-            },
+        module: splatShader, entryPoint: "fsMain",
+        targets: [{
+          format: "rgba16float",
+          blend: {
+            color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+            alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
           },
-        ],
+        }],
       },
-      primitive: {
-        topology: "triangle-list",
-        cullMode: "none",
-      },
+      primitive: { topology: "triangle-list", cullMode: "none" },
     });
 
-    this._rebuildBindGroup();
+    // ── Compose program ─────────────────────────────────────────────────
+    const composeShader = device.createShaderModule({ code: WGSL_COMPOSE });
 
-    this.clearValue = {
-      r: this.scene.render.backgroundTop[0],
-      g: this.scene.render.backgroundTop[1],
-      b: this.scene.render.backgroundTop[2],
-      a: this.scene.render.backgroundTop[3],
-    };
+    const bg = scene.render.backgroundTop;
+    this.bgBuffer = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(this.bgBuffer, 0,
+      new Float32Array([bg[0], bg[1], bg[2], bg[3]]));
+
+    this.accumSampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
+
+    this.composeBGL = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "non-filtering" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      ],
+    });
+
+    this.composePipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.composeBGL] }),
+      vertex:   { module: composeShader, entryPoint: "vsCompose" },
+      fragment: {
+        module: composeShader, entryPoint: "fsCompose",
+        targets: [{ format: this.format }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    this._rebuildSplatBindGroup();
+    // accumulation texture created on first resize()
   }
 
-  _rebuildBindGroup() {
-    this.bindGroup = this.device.createBindGroup({
-      layout: this.bindGroupLayout,
+  _rebuildSplatBindGroup() {
+    this.splatBindGroup = this.device.createBindGroup({
+      layout: this.splatBGL,
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
         { binding: 1, resource: { buffer: this.shBuffer } },
@@ -295,95 +339,112 @@ export class WebGPUSplatRenderer {
     });
   }
 
-  get label() {
-    return "webgpu";
+  _ensureAccumTexture(width, height) {
+    if (width === this._accumWidth && height === this._accumHeight) return;
+    this._accumWidth  = width;
+    this._accumHeight = height;
+    if (this.accumTexture) this.accumTexture.destroy();
+    this.accumTexture = this.device.createTexture({
+      size: [width, height],
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.accumView = this.accumTexture.createView();
+    this.composeBindGroup = this.device.createBindGroup({
+      layout: this.composeBGL,
+      entries: [
+        { binding: 0, resource: this.accumView },
+        { binding: 1, resource: this.accumSampler },
+        { binding: 2, resource: { buffer: this.bgBuffer } },
+      ],
+    });
   }
 
+  get label() { return "webgpu"; }
+
   resize(width, height) {
-    this.canvas.width = width;
+    this.canvas.width  = width;
     this.canvas.height = height;
+    this._ensureAccumTexture(width, height);
   }
 
   initSHData(shData) {
-    // Create/resize storage buffer and upload SH data, then rebuild bind group
+    const device = this.device;
     if (!this.shBuffer || this.shBuffer.size !== shData.byteLength) {
       if (this.shBuffer) this.shBuffer.destroy();
-      this.shBuffer = this.device.createBuffer({
+      this.shBuffer = device.createBuffer({
         size: shData.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
     }
-    this.device.queue.writeBuffer(
-      this.shBuffer, 0,
-      shData.buffer, shData.byteOffset, shData.byteLength,
-    );
-    this._rebuildBindGroup();
+    device.queue.writeBuffer(this.shBuffer, 0, shData.buffer, shData.byteOffset, shData.byteLength);
+    this._rebuildSplatBindGroup();
   }
 
   updateGeometryData(geomData) {
-    // Reuse the existing buffer if same size; only reallocate when it changes.
+    const device = this.device;
     if (!this.instanceBuffer || this.instanceBuffer.size !== geomData.byteLength) {
       if (this.instanceBuffer) this.instanceBuffer.destroy();
-      this.instanceBuffer = this.device.createBuffer({
+      this.instanceBuffer = device.createBuffer({
         size: geomData.byteLength,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       });
     }
-    this.device.queue.writeBuffer(
-      this.instanceBuffer, 0,
-      geomData.buffer, geomData.byteOffset, geomData.byteLength,
-    );
+    device.queue.writeBuffer(this.instanceBuffer, 0, geomData.buffer, geomData.byteOffset, geomData.byteLength);
     this.instanceCount = geomData.length / GEOM_FLOATS;
   }
 
-  // Alias for backwards compatibility
-  updateSceneData(geomData) {
-    return this.updateGeometryData(geomData);
-  }
+  updateSceneData(geomData) { return this.updateGeometryData(geomData); }
 
-  setRenderOptions(options) {
-    this.renderOptions = options;
-  }
+  setRenderOptions(options) { this.renderOptions = options; }
 
   render(cameraState) {
+    const device = this.device;
     const W = this.canvas.width;
     const H = this.canvas.height;
-    const focal = cameraState.focal;
+    this._ensureAccumTexture(W, H);
 
-    // Pack uniforms: viewProj(16) + view(16) + viewport(4) + params(4) + eye(4) = 44 floats
+    // Pack uniforms
     const packed = new Float32Array(44);
     packed.set(cameraState.viewProjection, 0);
     packed.set(cameraState.view, 16);
-    packed[32] = W;
-    packed[33] = H;
-    packed[34] = focal;
-    packed[35] = 0.0;
+    packed[32] = W; packed[33] = H; packed[34] = cameraState.focal; packed[35] = 0;
     packed[36] = this.renderOptions.alphaScale;
-    // packed[37..39] = 0 (default)
-    packed[40] = cameraState.eye[0];
-    packed[41] = cameraState.eye[1];
-    packed[42] = cameraState.eye[2];
-    packed[43] = 0.0;
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, packed.buffer);
+    packed[40] = cameraState.eye[0]; packed[41] = cameraState.eye[1];
+    packed[42] = cameraState.eye[2]; packed[43] = 0;
+    device.queue.writeBuffer(this.uniformBuffer, 0, packed.buffer);
 
-    const encoder = this.device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: this.context.getCurrentTexture().createView(),
-          clearValue: this.clearValue,
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
+    const encoder = device.createCommandEncoder();
+
+    // ── Pass 1: accumulate splats ────────────────────────────────────────
+    const accumPass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.accumView,
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: "clear",
+        storeOp: "store",
+      }],
     });
+    accumPass.setPipeline(this.splatPipeline);
+    accumPass.setBindGroup(0, this.splatBindGroup);
+    accumPass.setVertexBuffer(0, this.instanceBuffer);
+    accumPass.draw(6, this.instanceCount);
+    accumPass.end();
 
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bindGroup);
-    pass.setVertexBuffer(0, this.instanceBuffer);
-    pass.draw(6, this.instanceCount);
-    pass.end();
+    // ── Pass 2: compose to canvas ────────────────────────────────────────
+    const composePass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.context.getCurrentTexture().createView(),
+        loadOp: "clear",
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    composePass.setPipeline(this.composePipeline);
+    composePass.setBindGroup(0, this.composeBindGroup);
+    composePass.draw(3);
+    composePass.end();
 
-    this.device.queue.submit([encoder.finish()]);
+    device.queue.submit([encoder.finish()]);
   }
 }

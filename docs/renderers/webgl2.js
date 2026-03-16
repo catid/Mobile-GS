@@ -1,3 +1,8 @@
+// Mobile-GS two-pass renderer — matches the _ms CUDA blending formula (phi=0):
+//   Pass 1: accumulate (color * alpha_w, alpha_w) additively into RGBA16F FBO
+//   Pass 2: compose — C/w_fg * coverage + bg*(1-coverage), coverage=1-exp(-w_fg)
+//   weight = exp(min(max_scale / depth, 20))  — geometry-based, no MLP needed
+//
 // Geometry vertex buffer layout (12 floats = 48 bytes per splat):
 //   offset  0 : vec4  posOpacity  (x, y, z, opacity)
 //   offset 16 : vec4  quat        (qw, qx, qy, qz)
@@ -5,7 +10,10 @@
 // SH data stored in RGBA32F texture: width=2048, each splat occupies 12 texels
 const GEOM_FLOATS = 12;
 
-const VERTEX_SOURCE = `#version 300 es
+// ---------------------------------------------------------------------------
+// Pass 1: splat accumulation into float FBO
+// ---------------------------------------------------------------------------
+const SPLAT_VERT = `#version 300 es
 precision highp float;
 precision highp sampler2D;
 
@@ -23,7 +31,8 @@ uniform highp sampler2D uSHData;
 
 out vec3 vConic;
 out vec2 vCenterPix;
-out vec4 vColor;
+out vec4 vColor;    // rgb = SH color, a = opacity
+out float vWeight;  // Mobile-GS weight = exp(min(max_scale/depth, 20))
 
 vec2 quadVertex(int idx) {
   if (idx==0) return vec2(-1,-1); if (idx==1) return vec2(1,-1);
@@ -75,7 +84,7 @@ void main() {
   vec3 pos=aPosOpacity.xyz; float opacity=aPosOpacity.w; vec3 scale=aScaleIdx.xyz;
   int origIdx=int(aScaleIdx.w);
   vec4 pv=uView*vec4(pos,1.0); float fwd=-pv.z;
-  if(fwd<0.01){gl_Position=vec4(0,0,2,1);vConic=vec3(0);vCenterPix=vec2(0);vColor=vec4(0);return;}
+  if(fwd<0.01){gl_Position=vec4(0,0,2,1);vConic=vec3(0);vCenterPix=vec2(0);vColor=vec4(0);vWeight=0.0;return;}
   mat3 R=quatToMat(aQuat); mat3 W=mat3(uView);
   mat3 M=mat3(W*(R[0]*scale.x),W*(R[1]*scale.y),W*(R[2]*scale.z));
   mat3 Sv=M*transpose(M);
@@ -83,7 +92,7 @@ void main() {
   vec3 J0=vec3(uFocal*inv_d,0,uFocal*tx*inv_d2),J1=vec3(0,uFocal*inv_d,uFocal*ty*inv_d2);
   float cov00=dot(J0,Sv*J0)+0.3,cov01=dot(J0,Sv*J1),cov11=dot(J1,Sv*J1)+0.3;
   float det=cov00*cov11-cov01*cov01;
-  if(det<=0.0){gl_Position=vec4(0,0,2,1);vConic=vec3(0);vCenterPix=vec2(0);vColor=vec4(0);return;}
+  if(det<=0.0){gl_Position=vec4(0,0,2,1);vConic=vec3(0);vCenterPix=vec2(0);vColor=vec4(0);vWeight=0.0;return;}
   float inv_det=1.0/det;
   vec3 conic=vec3(cov11*inv_det,-cov01*inv_det,cov00*inv_det);
   float tr=cov00+cov11,disc=max(0.0,tr*tr-4.0*det);
@@ -98,30 +107,56 @@ void main() {
   vec4 b0=getSH(origIdx,8),b1=getSH(origIdx,9),b2=getSH(origIdx,10),b3=getSH(origIdx,11);
   vec3 dir=normalize(pos-uEye);
   vColor=vec4(evalSH3(dir,r0,r1,r2,r3,gg0,gg1,gg2,gg3,b0,b1,b2,b3),opacity);
+  float max_scale=max(scale.x,max(scale.y,scale.z));
+  vWeight=exp(min(max_scale/fwd,20.0));
 }
 `;
 
-const FRAGMENT_SOURCE = `#version 300 es
+const SPLAT_FRAG = `#version 300 es
 precision highp float;
 
 in vec3 vConic;
-in vec2 vCenterPix;   // y=0 at bottom (gl_FragCoord convention)
+in vec2 vCenterPix;
 in vec4 vColor;
+in float vWeight;
 
 uniform float uAlphaScale;
 
-out vec4 outColor;
+out vec4 outAccum;  // rgb = color * alpha_w,  a = alpha_w (w_fg)
 
 void main() {
-  // gl_FragCoord.y is 0 at bottom — consistent with vCenterPix
-  vec2  d     = gl_FragCoord.xy - vCenterPix;
-  float power = 0.5 * (vConic.x * d.x * d.x
-                     + 2.0 * vConic.y * d.x * d.y
-                     + vConic.z * d.y * d.y);
+  vec2 d = gl_FragCoord.xy - vCenterPix;
+  float power = 0.5*(vConic.x*d.x*d.x + 2.0*vConic.y*d.x*d.y + vConic.z*d.y*d.y);
   if (power > 8.0) discard;
-  float alpha = vColor.a * exp(-power) * uAlphaScale;
-  if (alpha < 0.00392) discard;
-  outColor = vec4(vColor.rgb * alpha, alpha);
+  float alpha_w = vColor.a * exp(-power) * uAlphaScale * vWeight;
+  if (alpha_w < 0.00001) discard;
+  outAccum = vec4(vColor.rgb * alpha_w, alpha_w);
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Pass 2: compose accumulation buffer with background
+// ---------------------------------------------------------------------------
+const COMPOSE_VERT = `#version 300 es
+void main() {
+  // Full-screen triangle — no vertex buffer needed
+  vec2 p[3]; p[0]=vec2(-1,-1); p[1]=vec2(3,-1); p[2]=vec2(-1,3);
+  gl_Position = vec4(p[gl_VertexID], 0, 1);
+}
+`;
+
+const COMPOSE_FRAG = `#version 300 es
+precision highp float;
+uniform highp sampler2D uAccum;
+uniform vec3 uBgColor;
+out vec4 outColor;
+void main() {
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(uAccum, 0));
+  vec4 accum = texture(uAccum, uv);
+  float w_fg = accum.a;
+  vec3 C_fg = (w_fg > 0.0001) ? accum.rgb / w_fg : vec3(0.0);
+  float coverage = 1.0 - exp(-w_fg);
+  outColor = vec4(mix(uBgColor, C_fg, coverage), 1.0);
 }
 `;
 
@@ -162,7 +197,11 @@ export class WebGL2SplatRenderer {
         alpha: true,
         premultipliedAlpha: true,
       });
-      if (!gl) {
+      if (!gl) return null;
+      // Need float renderable textures for accumulation FBO
+      if (!gl.getExtension("EXT_color_buffer_float") &&
+          !gl.getExtension("EXT_color_buffer_half_float")) {
+        console.warn("WebGL2: no float color buffer support");
         return null;
       }
       return new WebGL2SplatRenderer(canvas, scene, gl);
@@ -173,73 +212,100 @@ export class WebGL2SplatRenderer {
   }
 
   constructor(canvas, scene, gl) {
-    this.canvas = canvas;
-    this.scene  = scene;
-    this.gl     = gl;
-    this.program = linkProgram(gl, VERTEX_SOURCE, FRAGMENT_SOURCE);
+    this.canvas  = canvas;
+    this.scene   = scene;
+    this.gl      = gl;
     this.renderOptions = { alphaScale: scene.render.alphaScale };
-    this.shTexture = null;
+    this.shTexture     = null;
     this.instanceCount = 0;
+    this._instanceBufferSize = 0;
+    this._fboWidth  = 0;
+    this._fboHeight = 0;
 
-    this.locations = {
-      viewProj:   gl.getUniformLocation(this.program, "uViewProj"),
-      view:       gl.getUniformLocation(this.program, "uView"),
-      focal:      gl.getUniformLocation(this.program, "uFocal"),
-      width:      gl.getUniformLocation(this.program, "uWidth"),
-      height:     gl.getUniformLocation(this.program, "uHeight"),
-      eye:        gl.getUniformLocation(this.program, "uEye"),
-      alphaScale: gl.getUniformLocation(this.program, "uAlphaScale"),
+    // Determine best float format for the accumulation FBO
+    this._floatFmt = gl.getExtension("EXT_color_buffer_float")
+      ? gl.RGBA32F : gl.RGBA16F;
+    this._floatType = this._floatFmt === gl.RGBA32F ? gl.FLOAT : gl.HALF_FLOAT;
+
+    // Splat accumulation program
+    this.splatProgram   = linkProgram(gl, SPLAT_VERT, SPLAT_FRAG);
+    this.composeProgram = linkProgram(gl, COMPOSE_VERT, COMPOSE_FRAG);
+
+    // Splat program uniform locations
+    this.splatLoc = {
+      viewProj:   gl.getUniformLocation(this.splatProgram, "uViewProj"),
+      view:       gl.getUniformLocation(this.splatProgram, "uView"),
+      focal:      gl.getUniformLocation(this.splatProgram, "uFocal"),
+      width:      gl.getUniformLocation(this.splatProgram, "uWidth"),
+      height:     gl.getUniformLocation(this.splatProgram, "uHeight"),
+      eye:        gl.getUniformLocation(this.splatProgram, "uEye"),
+      alphaScale: gl.getUniformLocation(this.splatProgram, "uAlphaScale"),
       shData:     null,  // set in initSHData
     };
 
+    // Compose program uniform locations
+    this.composeLoc = {
+      accum:   gl.getUniformLocation(this.composeProgram, "uAccum"),
+      bgColor: gl.getUniformLocation(this.composeProgram, "uBgColor"),
+    };
+
+    // Geometry vertex buffer + VAO
     this.instanceBuffer = gl.createBuffer();
     this.vao = gl.createVertexArray();
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
-
-    const stride = GEOM_FLOATS * 4;   // 48 bytes
-
-    // attrs 0-2: posOpacity, quat, scaleIdx (offsets 0, 16, 32)
+    const stride = GEOM_FLOATS * 4;
     for (let i = 0; i < 3; i++) {
       gl.enableVertexAttribArray(i);
       gl.vertexAttribPointer(i, 4, gl.FLOAT, false, stride, i * 16);
       gl.vertexAttribDivisor(i, 1);
     }
-
     gl.bindVertexArray(null);
 
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    gl.disable(gl.DEPTH_TEST);
-    gl.clearColor(
-      scene.render.backgroundTop[0],
-      scene.render.backgroundTop[1],
-      scene.render.backgroundTop[2],
-      scene.render.backgroundTop[3],
-    );
+    // Accumulation FBO (created on first resize)
+    this.accumFBO     = gl.createFramebuffer();
+    this.accumTexture = gl.createTexture();
+
+    // Background colour
+    this._bg = scene.render.backgroundTop.slice(0, 3);
   }
 
-  get label() {
-    return "webgl2";
+  get label() { return "webgl2"; }
+
+  _ensureFBO(width, height) {
+    if (width === this._fboWidth && height === this._fboHeight) return;
+    const gl = this.gl;
+    this._fboWidth  = width;
+    this._fboHeight = height;
+    gl.bindTexture(gl.TEXTURE_2D, this.accumTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, this._floatFmt, width, height, 0,
+                  gl.RGBA, this._floatType, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                            gl.TEXTURE_2D, this.accumTexture, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
   resize(width, height) {
     this.canvas.width  = width;
     this.canvas.height = height;
     this.gl.viewport(0, 0, width, height);
+    this._ensureFBO(width, height);
   }
 
   initSHData(shData) {
     const gl = this.gl;
     const N = shData.length / 48;
     const SH_TEX_WIDTH = 2048;
-    const totalTexels = N * 12;
+    const totalTexels  = N * 12;
     const height = Math.ceil(totalTexels / SH_TEX_WIDTH);
-
-    // Pad to exact texture dimensions
     const texData = new Float32Array(SH_TEX_WIDTH * height * 4);
-    texData.set(shData);  // shData = N*48 floats = N*12 RGBA texels
-
+    texData.set(shData);
     if (!this.shTexture) this.shTexture = gl.createTexture();
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.shTexture);
@@ -247,52 +313,75 @@ export class WebGL2SplatRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SH_TEX_WIDTH, height, 0, gl.RGBA, gl.FLOAT, texData);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SH_TEX_WIDTH, height, 0,
+                  gl.RGBA, gl.FLOAT, texData);
     gl.bindTexture(gl.TEXTURE_2D, null);
-    this.locations.shData = gl.getUniformLocation(this.program, "uSHData");
+    this.splatLoc.shData = gl.getUniformLocation(this.splatProgram, "uSHData");
   }
 
   updateGeometryData(geomData) {
     this.instanceCount = geomData.length / GEOM_FLOATS;
-    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.instanceBuffer);
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
     if (this._instanceBufferSize === geomData.byteLength) {
-      this.gl.bufferSubData(this.gl.ARRAY_BUFFER, 0, geomData);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, geomData);
     } else {
-      this.gl.bufferData(this.gl.ARRAY_BUFFER, geomData, this.gl.DYNAMIC_DRAW);
+      gl.bufferData(gl.ARRAY_BUFFER, geomData, gl.DYNAMIC_DRAW);
       this._instanceBufferSize = geomData.byteLength;
     }
   }
 
-  // Alias for backwards compatibility
-  updateSceneData(geomData) {
-    return this.updateGeometryData(geomData);
-  }
+  updateSceneData(geomData) { return this.updateGeometryData(geomData); }
 
-  setRenderOptions(options) {
-    this.renderOptions = options;
-  }
+  setRenderOptions(options) { this.renderOptions = options; }
 
   render(cameraState) {
     const gl = this.gl;
+    const W  = this.canvas.width;
+    const H  = this.canvas.height;
+    this._ensureFBO(W, H);
+
+    // ── Pass 1: accumulate splats into float FBO ─────────────────────────
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
+    gl.viewport(0, 0, W, H);
+    gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.useProgram(this.program);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.disable(gl.DEPTH_TEST);
+
+    gl.useProgram(this.splatProgram);
     gl.bindVertexArray(this.vao);
 
-    gl.uniformMatrix4fv(this.locations.viewProj, false, cameraState.viewProjection);
-    gl.uniformMatrix4fv(this.locations.view,     false, cameraState.view);
-    gl.uniform1f(this.locations.focal,      cameraState.focal);
-    gl.uniform1f(this.locations.width,      this.canvas.width);
-    gl.uniform1f(this.locations.height,     this.canvas.height);
-    gl.uniform3fv(this.locations.eye,       cameraState.eye);
-    gl.uniform1f(this.locations.alphaScale, this.renderOptions.alphaScale);
+    gl.uniformMatrix4fv(this.splatLoc.viewProj, false, cameraState.viewProjection);
+    gl.uniformMatrix4fv(this.splatLoc.view,     false, cameraState.view);
+    gl.uniform1f(this.splatLoc.focal,      cameraState.focal);
+    gl.uniform1f(this.splatLoc.width,      W);
+    gl.uniform1f(this.splatLoc.height,     H);
+    gl.uniform3fv(this.splatLoc.eye,       cameraState.eye);
+    gl.uniform1f(this.splatLoc.alphaScale, this.renderOptions.alphaScale);
 
-    if (this.shTexture && this.locations.shData !== null) {
+    if (this.shTexture && this.splatLoc.shData !== null) {
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, this.shTexture);
-      gl.uniform1i(this.locations.shData, 1);
+      gl.uniform1i(this.splatLoc.shData, 1);
     }
 
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
     gl.bindVertexArray(null);
+
+    // ── Pass 2: compose with background ──────────────────────────────────
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);
+
+    gl.useProgram(this.composeProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.accumTexture);
+    gl.uniform1i(this.composeLoc.accum,   0);
+    gl.uniform3fv(this.composeLoc.bgColor, this._bg);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 }
