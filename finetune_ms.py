@@ -39,7 +39,8 @@ except ImportError:
 
 
 def training(dataset, opt, pipe, load_iter, model_out,
-             testing_iterations, saving_iterations, debug_from):
+             testing_iterations, saving_iterations, debug_from,
+             densify_from, densify_until, densify_interval, densify_grad_threshold):
 
     # ── Output dir ────────────────────────────────────────────────────────────
     os.makedirs(model_out, exist_ok=True)
@@ -59,6 +60,7 @@ def training(dataset, opt, pipe, load_iter, model_out,
     assert not gaussians.net_enabled, "Expected net_enabled=False (SH3 PLY path)"
 
     gaussians.training_setup(opt)
+    gaussians.max_radii2D = torch.zeros(len(gaussians.get_xyz), device="cuda")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -83,7 +85,9 @@ def training(dataset, opt, pipe, load_iter, model_out,
             pipe.debug = True
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image = render_pkg["render"]
+        image, viewspace_pt, visibility, radii = (render_pkg["render"],
+            render_pkg["viewspace_points"], render_pkg["visibility_filter"],
+            render_pkg["radii"])
 
         gt = viewpoint_cam.original_image.cuda()
         Ll1  = l1_loss(image, gt)
@@ -95,7 +99,8 @@ def training(dataset, opt, pipe, load_iter, model_out,
         with torch.no_grad():
             ema_loss = 0.4 * loss.item() + 0.6 * ema_loss
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss:.7f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss:.7f}",
+                                          "N": f"{len(gaussians.get_xyz):,}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -103,6 +108,22 @@ def training(dataset, opt, pipe, load_iter, model_out,
             if tb_writer:
                 tb_writer.add_scalar("train/l1_loss",    Ll1.item(),  iteration)
                 tb_writer.add_scalar("train/total_loss", loss.item(), iteration)
+
+            # ── Densification ─────────────────────────────────────────────────
+            if densify_until > 0:
+                gaussians.max_radii2D[visibility] = torch.max(
+                    gaussians.max_radii2D[visibility], radii[visibility])
+                gaussians.add_densification_stats(viewspace_pt, visibility)
+
+                if (iteration > densify_from and iteration < densify_until
+                        and iteration % densify_interval == 0):
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune(
+                        densify_grad_threshold, 0.005,
+                        scene.cameras_extent, size_threshold)
+
+                if iteration % opt.opacity_reset_interval == 0:
+                    gaussians.reset_opacity()
 
             # ── Evaluate ──────────────────────────────────────────────────────
             if iteration in testing_iterations:
@@ -158,9 +179,12 @@ if __name__ == "__main__":
     print("Output:", args.model_out)
     safe_state(args.quiet)
 
+    opt = op.extract(args)
     training(
-        lp.extract(args), op.extract(args), pp.extract(args),
+        lp.extract(args), opt, pp.extract(args),
         args.load_iter, args.model_out,
         args.test_iterations, args.save_iterations, args.debug_from,
+        opt.densify_from_iter, opt.densify_until_iter,
+        opt.densification_interval, opt.densify_grad_threshold,
     )
     print("Done.")
