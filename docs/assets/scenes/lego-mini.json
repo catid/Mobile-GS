@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "slug": "lego-mini",
   "title": "Mobile-GS Lego (pretrain 30k, SH3)",
   "binary": "lego-mini.bin",
@@ -32,15 +32,15 @@
     "alphaScale": 1.0,
     "sortIntervalMs": 120,
     "backgroundTop": [
-      0.05,
-      0.09,
-      0.17,
+      0.0,
+      0.0,
+      0.0,
       1.0
     ],
     "backgroundBottom": [
-      0.7,
-      0.82,
-      0.92,
+      0.0,
+      0.0,
+      0.0,
       1.0
     ]
   }

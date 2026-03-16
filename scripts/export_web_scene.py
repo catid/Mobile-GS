@@ -140,31 +140,33 @@ def main() -> None:
     binary_name  = f"{args.slug}.bin"
     manifest_name = f"{args.slug}.json"
 
-    # Binary layout per splat: 60 × float32 = 240 bytes (SH3 format)
-    #   [0-2]   xyz position
-    #   [3]     opacity (sigmoid-activated)
-    #   [4-7]   quaternion (qw, qx, qy, qz) normalised
-    #   [8-10]  scale (exp-activated sx, sy, sz)
-    #   [11]    padding
-    #   [12-27] sh_r[0..15] = [f_dc_r, f_rest_r_0..14]  (raw SH coefficients)
-    #   [28-43] sh_g[0..15] = [f_dc_g, f_rest_g_0..14]
-    #   [44-59] sh_b[0..15] = [f_dc_b, f_rest_b_0..14]
-    interleaved = np.zeros((n, 60), dtype=np.float32)
-    interleaved[:, 0:3]   = xyz
-    interleaved[:, 3]     = opacity
-    interleaved[:, 4:8]   = quat         # qw qx qy qz
-    interleaved[:, 8:11]  = scale
-    interleaved[:, 11]    = 0.0
-    interleaved[:, 12:28] = sh_r
-    interleaved[:, 28:44] = sh_g
-    interleaved[:, 44:60] = sh_b
-    interleaved.tofile(output_dir / binary_name)
+    # Binary format v4: two sections
+    # Section 1: geometry (12 floats per splat)
+    #   [0-2]  xyz position
+    #   [3]    opacity (sigmoid-activated)
+    #   [4-7]  quaternion (qw, qx, qy, qz) normalised
+    #   [8-10] scale (exp-activated sx, sy, sz)
+    #   [11]   float(originalIndex)
+    # Section 2: SH (48 floats per splat): sh_r[0..15], sh_g[0..15], sh_b[0..15]
+    geom = np.zeros((n, 12), dtype=np.float32)
+    geom[:, 0:3]  = xyz
+    geom[:, 3]    = opacity
+    geom[:, 4:8]  = quat
+    geom[:, 8:11] = scale
+    geom[:, 11]   = np.arange(n, dtype=np.float32)  # original splat index
+
+    # Section 2: SH (48 floats per splat): sh_r[0..15], sh_g[0..15], sh_b[0..15]
+    sh = np.concatenate([sh_r, sh_g, sh_b], axis=1)
+
+    with open(output_dir / binary_name, "wb") as f:
+        geom.tofile(f)
+        sh.tofile(f)
 
     cameras = load_cameras(args.cameras) if args.cameras else []
     camera_defaults = compute_camera_defaults(cameras, center, scene_radius)
 
     manifest = {
-        "version": 3,
+        "version": 4,
         "slug": args.slug,
         "title": args.title,
         "binary": binary_name,
@@ -179,8 +181,8 @@ def main() -> None:
         "render": {
             "alphaScale": 1.0,
             "sortIntervalMs": 120,
-            "backgroundTop": [0.05, 0.09, 0.17, 1.0],
-            "backgroundBottom": [0.7, 0.82, 0.92, 1.0],
+            "backgroundTop": [0.0, 0.0, 0.0, 1.0],
+            "backgroundBottom": [0.0, 0.0, 0.0, 1.0],
         },
     }
     (output_dir / manifest_name).write_text(json.dumps(manifest, indent=2))

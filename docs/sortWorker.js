@@ -11,7 +11,7 @@
  * The worker owns the splat buffer between sort calls.
  */
 
-const FLOATS_PER_SPLAT = 60;
+const FLOATS_PER_SPLAT = 12;
 
 let splats     = null;  // Float32Array — original unsorted splat data
 let sortedBuf  = null;  // Float32Array — output (ping-pong with main thread)

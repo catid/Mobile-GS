@@ -11,8 +11,8 @@ const alphaControl = document.querySelector("#alpha-control");
 const autorotateControl = document.querySelector("#autorotate-control");
 const fpsCounter = document.querySelector("#fps-counter");
 
-// Each splat is 60 floats (240 bytes): posOpacity | quat | scalePad | sh_r[16] | sh_g[16] | sh_b[16]
-const FLOATS_PER_SPLAT = 60;
+const GEOM_FLOATS = 12;   // geometry section: pos/opacity/quat/scale/origIdx
+const SH_FLOATS   = 48;   // SH section: sh_r[16] sh_g[16] sh_b[16]
 
 // How long (ms) to wait before requesting another sort when the camera is still.
 const SORT_INTERVAL_IDLE_MS = 200;
@@ -183,25 +183,25 @@ function resizeRenderer() {
 // Initial synchronous sort (runs once on boot before worker is ready)
 // ---------------------------------------------------------------------------
 
-function initialSort(splats, count) {
+function initialSort(geomSplats, count) {
   const eye = state.camera.eye;
   const forward = state.camera.forward;
   const depths = new Float32Array(count);
   const indices = new Int32Array(count);
   for (let i = 0; i < count; i++) {
     indices[i] = i;
-    const b = i * FLOATS_PER_SPLAT;
+    const b = i * GEOM_FLOATS;
     depths[i] =
-      (splats[b]     - eye[0]) * forward[0] +
-      (splats[b + 1] - eye[1]) * forward[1] +
-      (splats[b + 2] - eye[2]) * forward[2];
+      (geomSplats[b]     - eye[0]) * forward[0] +
+      (geomSplats[b + 1] - eye[1]) * forward[1] +
+      (geomSplats[b + 2] - eye[2]) * forward[2];
   }
   // Simple descending sort — only runs once so O(N log N) is fine
   indices.sort((a, b) => depths[b] - depths[a]);
-  const sorted = new Float32Array(splats.length);
+  const sorted = new Float32Array(count * GEOM_FLOATS);
   for (let w = 0; w < count; w++) {
-    const src = indices[w] * FLOATS_PER_SPLAT;
-    sorted.set(splats.subarray(src, src + FLOATS_PER_SPLAT), w * FLOATS_PER_SPLAT);
+    const src = indices[w] * GEOM_FLOATS;
+    sorted.set(geomSplats.subarray(src, src + GEOM_FLOATS), w * GEOM_FLOATS);
   }
   return sorted;
 }
@@ -228,7 +228,7 @@ function initSortWorker(splats) {
 
     if (msg.type === "sorted") {
       const sorted = new Float32Array(msg.buffer);
-      state.renderer.updateSceneData(sorted);
+      state.renderer.updateGeometryData(sorted);
       state.sortPending = false;
       state.lastSortTime = performance.now();
 
@@ -324,7 +324,10 @@ async function loadScene() {
   const binaryUrl = new URL(manifest.binary, new URL(SCENE_MANIFEST_URL, window.location.href)).toString();
   const buffer = await fetch(binaryUrl).then((r) => r.arrayBuffer());
   manifest.binaryUrl = binaryUrl;
-  manifest.splats = new Float32Array(buffer);
+  const N = manifest.splatCount;
+  // Split into two separate ArrayBuffers so each can be transferred independently
+  manifest.geomSplats = new Float32Array(buffer.slice(0, N * GEOM_FLOATS * 4));
+  manifest.shSplats   = new Float32Array(buffer.slice(N * GEOM_FLOATS * 4));
   return manifest;
 }
 
@@ -402,11 +405,14 @@ async function boot() {
 
     // Do an initial synchronous sort so the scene is visible on frame 1.
     setStatus("Sorting…");
-    const initialSorted = initialSort(scene.splats, scene.splatCount);
-    state.renderer.updateSceneData(initialSorted);
+    const initialSorted = initialSort(scene.geomSplats, scene.splatCount);
+    state.renderer.updateGeometryData(initialSorted);
 
-    // Hand the original (unsorted) splat data to the worker for async sorts.
-    initSortWorker(scene.splats); // transfers scene.splats.buffer to worker
+    // Upload static SH data to GPU
+    state.renderer.initSHData(scene.shSplats);
+
+    // Hand the original (unsorted) geometry data to the worker for async sorts.
+    initSortWorker(scene.geomSplats); // transfers scene.geomSplats.buffer to worker
 
     setStatus(`Ready · ${state.renderer.label}`);
     requestAnimationFrame(animateFrame);
