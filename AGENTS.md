@@ -71,13 +71,18 @@ finetune MLP weights are not saved.
 - Serves `docs/` via GitHub Pages (`catid.github.io/Mobile-GS`)
 - Uses `docs/assets/scenes/lego-mini.{bin,json}` — currently _ms 60k fine-tune (29.32 dB)
 - Renderer: WebGPU preferred, WebGL2 fallback; both implement full 3DGS covariance projection
-- **Two-pass Mobile-GS _ms formula** (no sort needed):
-  - Pass 1: additive accumulation into rgba16float FBO — `(color*alpha_w, alpha_w)` per pixel
-    `alpha_w = opacity * exp(-power) * alphaScale * weight`, `weight = exp(min(max_scale/depth, 20))`
-  - Pass 2: compose — `coverage = 1-exp(-w_fg)`, `output = mix(bg, C/w_fg, coverage)`
-- Note: pretrain model was trained with standard compositing (`render_impori`), so _ms rendering
-  may look slightly different from offline renders. The full fine-tuned model (trained with `_ms`)
-  will match correctly. Binary format v4: geometry (12 f32/splat) + SH (48 f32/splat).
+- **Two-pass Mobile-GS _ms formula with MRT log-transmittance** (no sort needed):
+  - Pass 1 (MRT): two render targets
+    - target 0 `rgba16float`: additive `(color*alpha_w, alpha_w)`
+    - target 1 `r16float`: additive `log(1-alpha_clamped)` — sums to `log(T)`
+  - Pass 2: `T = exp(logT)`, `coverage = 1-T`, `output = mix(bg, C/w_fg, coverage)`
+  - `alpha = min(0.99, opacity * exp(-power) * alphaScale)` — clamped exactly as CUDA
+  - `weight = exp(min(max_scale/depth, 20))` — in color only, does NOT affect T
+- **Coverage formula now matches CUDA exactly** (fixed Beer-Lambert transparency bug)
+- Binary format v5: geometry (11 f32/splat, no origIdx) + SH (48 f16/splat) = 28.1 MiB
+  - Previously v4: 12 f32 geom + 48 f32 SH = 48.2 MiB; float16 SH max error 0.007 (<1 bit)
+  - SH uploaded as `rgba16float` texture; GPU promotes f16→f32 transparently
+  - Use `instance_index` / `gl_InstanceID` for SH lookup (origIdx removed)
 - WebGPU compose pass uses `textureLoad` (not `textureSample`) to avoid unfilterable-float restriction.
   Canvas context is acquired AFTER initialize() to preserve WebGL2 fallback if WebGPU init fails.
 
