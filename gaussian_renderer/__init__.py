@@ -13,7 +13,7 @@ import torch
 import math
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from diff_gaussian_rasterization_ms import GaussianRasterizationSettings, GaussianRasterizer
 import matplotlib.pyplot as plt
 
 
@@ -191,7 +191,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     phi, opacity = pc.opacity_phi_nn(shs, scales, pc.get_xyz, dir_pp_normalized, rotations)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
-    rendered_image, radii = rasterizer(
+    rendered_image, radii, *_ = rasterizer(
         means3D=means3D,
         means2D=means2D,
         shs=shs,
