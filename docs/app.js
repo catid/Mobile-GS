@@ -14,21 +14,11 @@ const fpsCounter = document.querySelector("#fps-counter");
 const GEOM_FLOATS = 12;   // geometry section: pos/opacity/quat/scale/origIdx
 const SH_FLOATS   = 48;   // SH section: sh_r[16] sh_g[16] sh_b[16]
 
-// How long (ms) to wait before requesting another sort when the camera is still.
-const SORT_INTERVAL_IDLE_MS = 200;
-// How long (ms) after camera movement before re-sort while interacting.
-const SORT_INTERVAL_MOVING_MS = 40;
-
 const state = {
   scene: null,
   renderer: null,
   width: 0,
   height: 0,
-  // Sort worker state
-  worker: null,
-  sortPending: false,       // a sort request is in flight
-  sortNeeded: false,        // camera moved since last sort request
-  lastSortTime: 0,
   // Camera
   pointer: {
     active: false,
@@ -175,93 +165,6 @@ function resizeRenderer() {
   state.renderer.resize(width, height);
 }
 
-// ---------------------------------------------------------------------------
-// Sort worker
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Initial synchronous sort (runs once on boot before worker is ready)
-// ---------------------------------------------------------------------------
-
-function initialSort(geomSplats, count) {
-  const eye = state.camera.eye;
-  const forward = state.camera.forward;
-  const depths = new Float32Array(count);
-  const indices = new Int32Array(count);
-  for (let i = 0; i < count; i++) {
-    indices[i] = i;
-    const b = i * GEOM_FLOATS;
-    depths[i] =
-      (geomSplats[b]     - eye[0]) * forward[0] +
-      (geomSplats[b + 1] - eye[1]) * forward[1] +
-      (geomSplats[b + 2] - eye[2]) * forward[2];
-  }
-  // Simple descending sort — only runs once so O(N log N) is fine
-  indices.sort((a, b) => depths[b] - depths[a]);
-  const sorted = new Float32Array(count * GEOM_FLOATS);
-  for (let w = 0; w < count; w++) {
-    const src = indices[w] * GEOM_FLOATS;
-    sorted.set(geomSplats.subarray(src, src + GEOM_FLOATS), w * GEOM_FLOATS);
-  }
-  return sorted;
-}
-
-function initSortWorker(splats) {
-  const worker = new Worker(new URL("./sortWorker.js", import.meta.url), { type: "module" });
-
-  worker.onmessage = function (e) {
-    const msg = e.data;
-
-    if (msg.type === "ready") {
-      // Worker initialised — request first sort immediately
-      state.sortPending = false;
-      requestSort();
-      return;
-    }
-
-    if (msg.type === "skipped") {
-      // Worker's output buffer was still in transit; retry next frame
-      state.sortPending = false;
-      state.sortNeeded = true;
-      return;
-    }
-
-    if (msg.type === "sorted") {
-      const sorted = new Float32Array(msg.buffer);
-      state.renderer.updateGeometryData(sorted);
-      state.sortPending = false;
-      state.lastSortTime = performance.now();
-
-      // Return the buffer to the worker for reuse
-      worker.postMessage({ type: "returnBuffer", buffer: sorted.buffer }, [sorted.buffer]);
-
-      // If camera moved while sort was in flight, kick off another one
-      if (state.sortNeeded) {
-        requestSort();
-      }
-    }
-  };
-
-  // Transfer splat data to worker (zero-copy)
-  worker.postMessage({ type: "init", splats }, [splats.buffer]);
-  state.worker = worker;
-  state.sortPending = true; // waiting for "ready"
-}
-
-function requestSort() {
-  if (state.sortPending || !state.worker) return;
-  state.sortPending = true;
-  state.sortNeeded = false;
-  state.worker.postMessage({
-    type: "sort",
-    eye:     Array.from(state.camera.eye),
-    forward: Array.from(state.camera.forward),
-  });
-}
-
-function scheduleSort() {
-  state.sortNeeded = true;
-}
 
 // ---------------------------------------------------------------------------
 // Controls
@@ -300,7 +203,6 @@ function bindControls() {
     state.pointer.y = event.clientY;
     state.camera.yaw -= dx * 0.006;
     state.camera.pitch = clamp(state.camera.pitch - dy * 0.006, -1.25, 1.25);
-    scheduleSort();
   });
 
   const releasePointer = () => { state.pointer.active = false; };
@@ -311,7 +213,6 @@ function bindControls() {
     event.preventDefault();
     const scale = Math.exp(event.deltaY * 0.001);
     state.camera.distance = clamp(state.camera.distance * scale, 0.8, 20.0);
-    scheduleSort();
   }, { passive: false });
 }
 
@@ -352,7 +253,6 @@ function animateFrame(time) {
 
   if (autorotateControl.checked && !state.pointer.active) {
     state.camera.yaw += 0.0014;
-    scheduleSort();
   }
 
   // FPS counter
@@ -365,14 +265,6 @@ function animateFrame(time) {
   }
 
   updateCamera(state.width, state.height);
-
-  // Kick off a sort if needed (or periodically to keep up with autorotate)
-  if (!state.sortPending) {
-    const interval = state.pointer.active ? SORT_INTERVAL_MOVING_MS : SORT_INTERVAL_IDLE_MS;
-    if (state.sortNeeded && time - state.lastSortTime >= interval) {
-      requestSort();
-    }
-  }
 
   state.renderer.render(state.camera);
   window.__viewerInfo = {
@@ -403,16 +295,11 @@ async function boot() {
     resizeRenderer();
     updateCamera(state.width || 1, state.height || 1);
 
-    // Do an initial synchronous sort so the scene is visible on frame 1.
-    setStatus("Sorting…");
-    const initialSorted = initialSort(scene.geomSplats, scene.splatCount);
-    state.renderer.updateGeometryData(initialSorted);
+    // Upload geometry data directly — no sort needed (Mobile-GS uses order-independent blending)
+    state.renderer.updateGeometryData(scene.geomSplats);
 
     // Upload static SH data to GPU
     state.renderer.initSHData(scene.shSplats);
-
-    // Hand the original (unsorted) geometry data to the worker for async sorts.
-    initSortWorker(scene.geomSplats); // transfers scene.geomSplats.buffer to worker
 
     setStatus(`Ready · ${state.renderer.label}`);
     requestAnimationFrame(animateFrame);

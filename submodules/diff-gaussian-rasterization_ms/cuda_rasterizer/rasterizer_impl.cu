@@ -90,18 +90,17 @@ __global__ void duplicateWithKeys(
 
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
-		// For each tile that the bounding rect overlaps, emit a 
-		// key/value pair. The key is |  tile ID  |      depth      |,
-		// and the value is the ID of the Gaussian. Sorting the values 
-		// with this key yields Gaussian IDs in a list, such that they
-		// are first sorted by tile and then by depth. 
+		// For each tile that the bounding rect overlaps, emit a
+		// key/value pair. The key is |  tile ID  | (no depth) |,
+		// and the value is the ID of the Gaussian. Mobile-GS uses
+		// order-independent weighted blending (C/w_fg), so depth
+		// ordering within a tile is not required.
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
 				uint64_t key = y * grid.x + x;
 				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
 				gaussian_keys_unsorted[off] = key;
 				gaussian_values_unsorted[off] = idx;
 				off++;
