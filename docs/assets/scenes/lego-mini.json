@@ -1,7 +1,7 @@
 {
   "version": 4,
   "slug": "lego-mini",
-  "title": "Mobile-GS Lego (_ms fine-tune 30k, SH3, 29 dB)",
+  "title": "Mobile-GS Lego (_ms 60k fine-tune, SH3, 29.3 dB)",
   "binary": "lego-mini.bin",
   "splatCount": 210707,
   "bounds": {
