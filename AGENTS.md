@@ -53,18 +53,23 @@ For export: use the PLY saved by `scene.save()`, which (after our fix) writes
 better web-viewer PSNR (36.5 dB) than the finetune PLY (24.9 dB DC-only) because the
 finetune MLP weights are not saved.
 
-### Fine-tune quality summary (lego_wb_finetune, 60k iter, _ms rasterizer)
+### Fine-tune quality summary (_ms rasterizer, lego white-bg)
 - Pretrain + SH3 + standard compositing:    36.17 dB (trained for this formula)
 - Pretrain + SH3 + _ms formula:            21.00 dB (not trained for _ms)
 - Fine-tuned + SH1 + _ms formula:          21.23 dB (phi MLP not in PLY, SH1 only)
 - Fine-tuned PLY has SH1 (9 f_rest fields) because `onedownSHdegree()` reduces degree
   at fine-tune start and `net_enabled=True` replaces higher SH with MLP.
-- **Web viewer uses pretrain SH3 PLY** — keep until a SH3+_ms fine-tune is available.
+- **finetune_ms.py pass 1** (30k from pretrain SH3):  29.05 dB — `output/lego_wb_ms/`
+- **finetune_ms.py pass 2** (30k from pass 1, 60k total): 29.32 dB — `output/lego_wb_ms_60k/`
+- **Web viewer uses pass-2 SH3 PLY** (29.32 dB, 210,707 splats)
 - Fine-tuned `.pth` checkpoint at `output/lego_wb_finetune/` has the full trained phi MLP.
+- `finetune_ms.py` bug fixed: opacity_reset_interval=3000 fired at iter 30000 (final),
+  resetting opacities to near-zero → 10.8 dB all-white renders. Fixed by skipping reset
+  after `densify_until` (default 15000).
 
 ### Web viewer
 - Serves `docs/` via GitHub Pages (`catid.github.io/Mobile-GS`)
-- Uses `docs/assets/scenes/lego-mini.{bin,json}` — currently pretrain 30k (36.17 dB, white bg)
+- Uses `docs/assets/scenes/lego-mini.{bin,json}` — currently _ms 60k fine-tune (29.32 dB)
 - Renderer: WebGPU preferred, WebGL2 fallback; both implement full 3DGS covariance projection
 - **Two-pass Mobile-GS _ms formula** (no sort needed):
   - Pass 1: additive accumulation into rgba16float FBO — `(color*alpha_w, alpha_w)` per pixel
