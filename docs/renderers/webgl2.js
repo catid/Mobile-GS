@@ -128,7 +128,7 @@ in float vWeight;
 uniform float uAlphaScale;
 
 layout(location = 0) out vec4 outAccum;  // rgb = color * alpha_w,  a = alpha_w (w_fg)
-layout(location = 1) out float outLogT;  // log(1 - alpha_clamped) — negative, sums to log(T)
+layout(location = 1) out vec4 outLogT;   // .r = log(1 - alpha_clamped) — negative, sums to log(T)
 
 void main() {
   vec2 d = gl_FragCoord.xy - vCenterPix;
@@ -140,7 +140,7 @@ void main() {
   if (alpha_w < 0.00001) discard;
   outAccum = vec4(vColor.rgb * alpha_w, alpha_w);
   // log-transmittance: weight-independent, matches CUDA T = prod(1-alpha)
-  outLogT = log(1.0 - alpha);
+  outLogT = vec4(log(1.0 - alpha), 0.0, 0.0, 0.0);
 }
 `;
 
@@ -241,9 +241,9 @@ export class WebGL2SplatRenderer {
     const hasFloat = !!gl.getExtension("EXT_color_buffer_float");
     this._floatFmt  = hasFloat ? gl.RGBA32F : gl.RGBA16F;
     this._floatType = hasFloat ? gl.FLOAT   : gl.HALF_FLOAT;
-    // Single-channel float format for log-transmittance render target
-    this._r1Fmt  = hasFloat ? gl.R32F   : gl.R16F;
-    this._r1Type = hasFloat ? gl.FLOAT  : gl.HALF_FLOAT;
+    // Use same RGBA format for logT texture — avoids R-format MRT compatibility issues
+    this._r1Fmt  = this._floatFmt;
+    this._r1Type = this._floatType;
 
     // Splat accumulation program
     this.splatProgram   = linkProgram(gl, SPLAT_VERT, SPLAT_FRAG);
@@ -314,7 +314,7 @@ export class WebGL2SplatRenderer {
     };
 
     setupTex(this.accumTexture, this._floatFmt, gl.RGBA, this._floatType);
-    setupTex(this.logTTexture,  this._r1Fmt,   gl.RED,  this._r1Type);
+    setupTex(this.logTTexture,  this._r1Fmt,   gl.RGBA, this._r1Type);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
