@@ -20,6 +20,7 @@
           <div class="meta">
             <span id="scene-title">Loading scene…</span>
             <span id="renderer-label">Renderer: probing</span>
+            <span id="fps-counter">0 FPS</span>
           </div>
           <div class="controls">
             <label>
@@ -42,6 +43,41 @@
           <p class="hint">
             Drag to orbit. Wheel to dolly. Open this folder through GitHub Pages or any static file host.
           </p>
+          <section class="reference-gallery" aria-labelledby="offline-reference-title">
+            <div class="reference-copy">
+              <p class="reference-kicker">Offline CUDA Reference</p>
+              <h2 id="offline-reference-title">Six native render views</h2>
+              <p class="reference-note">
+                Offline renders from the bundled Mobile-GS model: front, back, left, right, top, and bottom.
+              </p>
+            </div>
+            <div class="reference-grid">
+              <figure class="reference-card">
+                <img src="./assets/offline-views/front.png" alt="Offline renderer front view" loading="lazy" />
+                <figcaption>Front</figcaption>
+              </figure>
+              <figure class="reference-card">
+                <img src="./assets/offline-views/back.png" alt="Offline renderer back view" loading="lazy" />
+                <figcaption>Back</figcaption>
+              </figure>
+              <figure class="reference-card">
+                <img src="./assets/offline-views/left.png" alt="Offline renderer left view" loading="lazy" />
+                <figcaption>Left</figcaption>
+              </figure>
+              <figure class="reference-card">
+                <img src="./assets/offline-views/right.png" alt="Offline renderer right view" loading="lazy" />
+                <figcaption>Right</figcaption>
+              </figure>
+              <figure class="reference-card">
+                <img src="./assets/offline-views/top.png" alt="Offline renderer top view" loading="lazy" />
+                <figcaption>Top</figcaption>
+              </figure>
+              <figure class="reference-card">
+                <img src="./assets/offline-views/bottom.png" alt="Offline renderer bottom view" loading="lazy" />
+                <figcaption>Bottom</figcaption>
+              </figure>
+            </div>
+          </section>
           <p class="build-time">Built: 2026-03-17 11:30 UTC</p>
         </div>
       </section>
@@ -51,7 +87,6 @@
           <canvas id="viewer-canvas-webgl" class="viewer-canvas"></canvas>
         </div>
         <div id="status-badge" class="status-badge">Booting viewer…</div>
-        <div id="fps-counter" class="fps-counter">0 FPS</div>
       </section>
     </main>
     <script type="module" src="./app.js"></script>
