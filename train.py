@@ -58,7 +58,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.init_vnn(opt)
         gaussians.training_setup(opt)
-        gaussians.optimizer.load_state_dict(opt_dict)
+        gaussians.ensure_consistent_counts()
+        try:
+            gaussians.optimizer.load_state_dict(opt_dict)
+        except ValueError as error:
+            print(f"Warning: optimizer state load failed ({error}), continuing with fresh optimizer state.")
     print("current Gaussian number:", len(gaussians._xyz))
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

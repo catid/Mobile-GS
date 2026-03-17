@@ -2,6 +2,8 @@ import torch
 
 from .modules.lpips import LPIPS
 
+_CRITERION_CACHE = {}
+
 
 def lpips(x: torch.Tensor,
           y: torch.Tensor,
@@ -17,5 +19,10 @@ def lpips(x: torch.Tensor,
         version (str): the version of LPIPS. Default: 0.1.
     """
     device = x.device
-    criterion = LPIPS(net_type, version).to(device)
+    cache_key = (net_type, version, str(device))
+    criterion = _CRITERION_CACHE.get(cache_key)
+    if criterion is None:
+        criterion = LPIPS(net_type, version).to(device)
+        criterion.eval()
+        _CRITERION_CACHE[cache_key] = criterion
     return criterion(x, y)
