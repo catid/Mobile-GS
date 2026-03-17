@@ -233,11 +233,14 @@ export class WebGPUSplatRenderer {
     try {
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) return null;
-      const device  = await adapter.requestDevice();
+      const supportsFloat32Blend = adapter.features.has("float32-blendable");
+      const device = await adapter.requestDevice({
+        requiredFeatures: supportsFloat32Blend ? ["float32-blendable"] : [],
+      });
       const format  = navigator.gpu.getPreferredCanvasFormat();
       // Delay canvas context acquisition until AFTER initialize() succeeds,
       // so a failed init doesn't prevent WebGL2 from claiming the canvas.
-      const renderer = new WebGPUSplatRenderer(canvas, scene, device, format);
+      const renderer = new WebGPUSplatRenderer(canvas, scene, device, format, supportsFloat32Blend);
       await renderer.initialize();
       // All init succeeded — now claim the canvas context
       const context = canvas.getContext("webgpu");
@@ -251,12 +254,14 @@ export class WebGPUSplatRenderer {
     }
   }
 
-  constructor(canvas, scene, device, format) {
+  constructor(canvas, scene, device, format, supportsFloat32Blend) {
     this.canvas  = canvas;
     this.scene   = scene;
     this.device  = device;
     this.context = null;  // set by create() after initialize() succeeds
     this.format  = format;
+    this.accumFormat = supportsFloat32Blend ? "rgba32float" : "rgba16float";
+    this.logTFormat = supportsFloat32Blend ? "rgba32float" : "rgba16float";
     this.instanceCount = 0;
     this.renderOptions = { alphaScale: scene.render.alphaScale };
     this._accumWidth  = 0;
@@ -311,7 +316,7 @@ export class WebGPUSplatRenderer {
       vertex: { module: splatShader, entryPoint: "vsMain", ...splatVtx },
       fragment: {
         module: splatShader, entryPoint: "fsAccum",
-        targets: [{ format: "rgba16float", blend: addBlend }],
+        targets: [{ format: this.accumFormat, blend: addBlend }],
       },
       primitive: { topology: "triangle-list", cullMode: "none" },
     });
@@ -322,7 +327,7 @@ export class WebGPUSplatRenderer {
       vertex: { module: splatShader, entryPoint: "vsMain", ...splatVtx },
       fragment: {
         module: splatShader, entryPoint: "fsLogT",
-        targets: [{ format: "rgba16float", blend: addBlend }],
+        targets: [{ format: this.logTFormat, blend: addBlend }],
       },
       primitive: { topology: "triangle-list", cullMode: "none" },
     });
@@ -379,12 +384,12 @@ export class WebGPUSplatRenderer {
     if (this.logTTexture)  this.logTTexture.destroy();
     this.accumTexture = this.device.createTexture({
       size: [width, height],
-      format: "rgba16float",
+      format: this.accumFormat,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.logTTexture = this.device.createTexture({
       size: [width, height],
-      format: "rgba16float",
+      format: this.logTFormat,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.accumView = this.accumTexture.createView();

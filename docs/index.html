@@ -23,6 +23,14 @@
           </div>
           <div class="controls">
             <label>
+              <span>Renderer</span>
+              <select id="renderer-select">
+                <option value="auto">Auto</option>
+                <option value="webgpu">WebGPU</option>
+                <option value="webgl2">WebGL2</option>
+              </select>
+            </label>
+            <label>
               <span>Opacity</span>
               <input id="alpha-control" type="range" min="0.25" max="1.8" step="0.01" />
             </label>
@@ -38,7 +46,10 @@
         </div>
       </section>
       <section class="viewport">
-        <canvas id="viewer-canvas"></canvas>
+        <div id="viewer-stage" class="canvas-stack">
+          <canvas id="viewer-canvas-webgpu" class="viewer-canvas"></canvas>
+          <canvas id="viewer-canvas-webgl" class="viewer-canvas"></canvas>
+        </div>
         <div id="status-badge" class="status-badge">Booting viewer…</div>
         <div id="fps-counter" class="fps-counter">0 FPS</div>
       </section>

@@ -2,22 +2,35 @@ import { WebGL2SplatRenderer } from "./renderers/webgl2.js";
 import { WebGPUSplatRenderer } from "./renderers/webgpu.js";
 
 const SCENE_MANIFEST_URL = "./assets/scenes/lego-mini.json";
+const RENDERER_QUERY_KEY = "renderer";
 
-const canvas = document.querySelector("#viewer-canvas");
+const canvasStage = document.querySelector("#viewer-stage");
+const rendererCanvases = {
+  webgpu: document.querySelector("#viewer-canvas-webgpu"),
+  webgl2: document.querySelector("#viewer-canvas-webgl"),
+};
 const sceneTitle = document.querySelector("#scene-title");
 const rendererLabel = document.querySelector("#renderer-label");
 const statusBadge = document.querySelector("#status-badge");
+const rendererSelect = document.querySelector("#renderer-select");
 const alphaControl = document.querySelector("#alpha-control");
 const autorotateControl = document.querySelector("#autorotate-control");
 const fpsCounter = document.querySelector("#fps-counter");
 
 // Binary format v5: geometry (11 f32/splat) + SH (48 f16/splat)
 const GEOM_FLOATS = 11;   // geometry: pos/opacity/quat/scale (origIdx removed, use instance ID)
-const SH_FLOATS   = 48;   // SH: sh_r[16] sh_g[16] sh_b[16], stored as float16
+const SH_FLOATS = 48;     // SH: sh_r[16] sh_g[16] sh_b[16], stored as float16
 
 const state = {
   scene: null,
-  renderer: null,
+  renderers: {
+    webgpu: null,
+    webgl2: null,
+  },
+  activeRendererKey: null,
+  rendererPreference: readRendererPreference(),
+  rendererSwitchToken: 0,
+  resizedRendererKey: null,
   width: 0,
   height: 0,
   // Camera
@@ -49,6 +62,115 @@ const state = {
     value: 0,
   },
 };
+
+// ---------------------------------------------------------------------------
+// Renderer selection
+// ---------------------------------------------------------------------------
+
+function normalizeRendererMode(value) {
+  if (value === "webgl") return "webgl2";
+  if (value === "webgpu" || value === "webgl2" || value === "auto") return value;
+  return "auto";
+}
+
+function readRendererPreference() {
+  const url = new URL(window.location.href);
+  return normalizeRendererMode(url.searchParams.get(RENDERER_QUERY_KEY));
+}
+
+function writeRendererPreference(mode) {
+  const url = new URL(window.location.href);
+  if (mode === "auto") {
+    url.searchParams.delete(RENDERER_QUERY_KEY);
+  } else {
+    url.searchParams.set(RENDERER_QUERY_KEY, mode);
+  }
+  window.history.replaceState(null, "", url);
+}
+
+function getActiveRenderer() {
+  return state.activeRendererKey ? state.renderers[state.activeRendererKey] : null;
+}
+
+function rendererFactory(key) {
+  if (key === "webgpu") return WebGPUSplatRenderer.create(rendererCanvases.webgpu, state.scene);
+  if (key === "webgl2") return WebGL2SplatRenderer.create(rendererCanvases.webgl2, state.scene);
+  throw new Error(`Unknown renderer ${key}`);
+}
+
+async function ensureRenderer(key) {
+  if (state.renderers[key]) return state.renderers[key];
+  const renderer = await rendererFactory(key);
+  if (!renderer) return null;
+  state.renderers[key] = renderer;
+  renderer.setRenderOptions(state.renderOptions);
+  if (state.width > 0 && state.height > 0) {
+    renderer.resize(state.width, state.height);
+  }
+  renderer.updateGeometryData(state.scene.geomSplats);
+  renderer.initSHData(state.scene.shSplats);
+  return renderer;
+}
+
+function setCanvasVisibility(activeKey) {
+  for (const [key, canvas] of Object.entries(rendererCanvases)) {
+    canvas.classList.toggle("is-active", key === activeKey);
+  }
+}
+
+async function resolveRenderer(preference) {
+  const order =
+    preference === "webgpu" ? ["webgpu", "webgl2"] :
+    preference === "webgl2" ? ["webgl2", "webgpu"] :
+    ["webgpu", "webgl2"];
+
+  for (let index = 0; index < order.length; index += 1) {
+    const key = order[index];
+    const renderer = await ensureRenderer(key);
+    if (!renderer) continue;
+    return {
+      key,
+      renderer,
+      fallback: index > 0,
+    };
+  }
+
+  throw new Error("This browser does not expose WebGPU or WebGL2.");
+}
+
+async function switchRenderer(preference) {
+  const normalized = normalizeRendererMode(preference);
+  const token = ++state.rendererSwitchToken;
+  state.rendererPreference = normalized;
+  rendererSelect.value = normalized;
+  writeRendererPreference(normalized);
+
+  const requestedLabel = normalized === "auto" ? "renderer" : normalized;
+  setStatus(`Initializing ${requestedLabel}…`);
+
+  const result = await resolveRenderer(normalized);
+  if (token !== state.rendererSwitchToken) return;
+
+  state.activeRendererKey = result.key;
+  state.resizedRendererKey = null;
+  setCanvasVisibility(result.key);
+  resizeRenderer();
+  updateCamera(state.width || 1, state.height || 1);
+
+  const actualRenderer = getActiveRenderer();
+  rendererLabel.textContent = `Renderer: ${actualRenderer.label}`;
+  if (result.fallback && normalized !== "auto") {
+    setStatus(`${normalized} unavailable · using ${actualRenderer.label}`);
+  } else {
+    setStatus(`Ready · ${actualRenderer.label}`);
+  }
+}
+
+function updateAllRenderOptions() {
+  for (const renderer of Object.values(state.renderers)) {
+    renderer?.setRenderOptions(state.renderOptions);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Math helpers
@@ -111,9 +233,9 @@ function lookAt(out, eye, target, up) {
   out[0] = xAxis[0]; out[1] = yAxis[0]; out[2] = zAxis[0]; out[3] = 0;
   out[4] = xAxis[1]; out[5] = yAxis[1]; out[6] = zAxis[1]; out[7] = 0;
   out[8] = xAxis[2]; out[9] = yAxis[2]; out[10] = zAxis[2]; out[11] = 0;
-  out[12] = -(xAxis[0]*eye[0] + xAxis[1]*eye[1] + xAxis[2]*eye[2]);
-  out[13] = -(yAxis[0]*eye[0] + yAxis[1]*eye[1] + yAxis[2]*eye[2]);
-  out[14] = -(zAxis[0]*eye[0] + zAxis[1]*eye[1] + zAxis[2]*eye[2]);
+  out[12] = -(xAxis[0] * eye[0] + xAxis[1] * eye[1] + xAxis[2] * eye[2]);
+  out[13] = -(yAxis[0] * eye[0] + yAxis[1] * eye[1] + yAxis[2] * eye[2]);
+  out[14] = -(zAxis[0] * eye[0] + zAxis[1] * eye[1] + zAxis[2] * eye[2]);
   out[15] = 1;
   return out;
 }
@@ -158,14 +280,18 @@ function updateCamera(width, height) {
 }
 
 function resizeRenderer() {
-  const width = Math.floor(canvas.clientWidth * window.devicePixelRatio);
-  const height = Math.floor(canvas.clientHeight * window.devicePixelRatio);
-  if (width === state.width && height === state.height) return;
+  const renderer = getActiveRenderer();
+  if (!renderer) return;
+  const width = Math.floor(canvasStage.clientWidth * window.devicePixelRatio);
+  const height = Math.floor(canvasStage.clientHeight * window.devicePixelRatio);
+  if (width === state.width && height === state.height && state.resizedRendererKey === state.activeRendererKey) {
+    return;
+  }
   state.width = width;
   state.height = height;
-  state.renderer.resize(width, height);
+  state.resizedRendererKey = state.activeRendererKey;
+  renderer.resize(width, height);
 }
-
 
 // ---------------------------------------------------------------------------
 // Controls
@@ -175,28 +301,31 @@ function setStatus(message) {
   statusBadge.textContent = message;
 }
 
-async function chooseRenderer(scene) {
-  const webgpu = await WebGPUSplatRenderer.create(canvas, scene);
-  if (webgpu) return webgpu;
-  const webgl = await WebGL2SplatRenderer.create(canvas, scene);
-  if (webgl) return webgl;
-  throw new Error("This browser does not expose WebGPU or WebGL2.");
-}
-
 function bindControls() {
-  alphaControl.addEventListener("input", () => {
-    state.renderOptions.alphaScale = Number(alphaControl.value);
-    state.renderer.setRenderOptions(state.renderOptions);
+  rendererSelect.value = state.rendererPreference;
+  rendererSelect.addEventListener("change", async () => {
+    try {
+      await switchRenderer(rendererSelect.value);
+    } catch (error) {
+      console.error(error);
+      rendererLabel.textContent = "Renderer: unavailable";
+      setStatus(error.message);
+    }
   });
 
-  canvas.addEventListener("pointerdown", (event) => {
+  alphaControl.addEventListener("input", () => {
+    state.renderOptions.alphaScale = Number(alphaControl.value);
+    updateAllRenderOptions();
+  });
+
+  canvasStage.addEventListener("pointerdown", (event) => {
     state.pointer.active = true;
     state.pointer.x = event.clientX;
     state.pointer.y = event.clientY;
-    canvas.setPointerCapture(event.pointerId);
+    canvasStage.setPointerCapture(event.pointerId);
   });
 
-  canvas.addEventListener("pointermove", (event) => {
+  canvasStage.addEventListener("pointermove", (event) => {
     if (!state.pointer.active) return;
     const dx = event.clientX - state.pointer.x;
     const dy = event.clientY - state.pointer.y;
@@ -207,10 +336,10 @@ function bindControls() {
   });
 
   const releasePointer = () => { state.pointer.active = false; };
-  canvas.addEventListener("pointerup", releasePointer);
-  canvas.addEventListener("pointercancel", releasePointer);
+  canvasStage.addEventListener("pointerup", releasePointer);
+  canvasStage.addEventListener("pointercancel", releasePointer);
 
-  canvas.addEventListener("wheel", (event) => {
+  canvasStage.addEventListener("wheel", (event) => {
     event.preventDefault();
     const scale = Math.exp(event.deltaY * 0.001);
     state.camera.distance = clamp(state.camera.distance * scale, 0.8, 20.0);
@@ -230,7 +359,7 @@ async function loadScene() {
   // Split into two separate ArrayBuffers so each can be transferred independently
   manifest.geomSplats = new Float32Array(buffer.slice(0, N * GEOM_FLOATS * 4));
   // SH stored as float16 (2 bytes each) in v5; pass raw uint16 bits to renderers
-  manifest.shSplats   = new Uint16Array(buffer.slice(N * GEOM_FLOATS * 4));
+  manifest.shSplats = new Uint16Array(buffer.slice(N * GEOM_FLOATS * 4));
   return manifest;
 }
 
@@ -268,12 +397,14 @@ function animateFrame(time) {
 
   updateCamera(state.width, state.height);
 
-  state.renderer.render(state.camera);
+  const renderer = getActiveRenderer();
+  renderer?.render(state.camera);
   window.__viewerInfo = {
-    renderer: state.renderer.label,
+    renderer: renderer?.label ?? "unavailable",
     scene: state.scene.slug,
     splatCount: state.scene.splatCount,
-    ready: true,
+    ready: Boolean(renderer),
+    requestedRenderer: state.rendererPreference,
   };
   requestAnimationFrame(animateFrame);
 }
@@ -287,23 +418,9 @@ async function boot() {
     setStatus("Loading scene asset…");
     const scene = await loadScene();
     initializeScene(scene);
-
-    setStatus("Selecting renderer…");
-    state.renderer = await chooseRenderer(scene);
-    rendererLabel.textContent = `Renderer: ${state.renderer.label}`;
-    state.renderer.setRenderOptions(state.renderOptions);
-
     bindControls();
-    resizeRenderer();
-    updateCamera(state.width || 1, state.height || 1);
 
-    // Upload geometry data directly — no sort needed (Mobile-GS uses order-independent blending)
-    state.renderer.updateGeometryData(scene.geomSplats);
-
-    // Upload static SH data to GPU
-    state.renderer.initSHData(scene.shSplats);
-
-    setStatus(`Ready · ${state.renderer.label}`);
+    await switchRenderer(state.rendererPreference);
     requestAnimationFrame(animateFrame);
   } catch (error) {
     console.error(error);
