@@ -51,7 +51,7 @@ struct VertexOutput {
 
 struct FragOut {
   @location(0) accum : vec4<f32>,  // color*alpha_w, alpha_w (w_fg)
-  @location(1) logT  : f32,        // log(1-alpha_clamped) — negative, sums to log(T)
+  @location(1) logT  : vec4<f32>,  // .r = log(1-alpha) — negative, sums to log(T)
 };
 
 const quad = array<vec2<f32>, 6>(
@@ -177,7 +177,9 @@ fn vsMain(
 
 @fragment
 fn fsMain(in: VertexOutput) -> FragOut {
-  let d = in.position.xy - in.centerPix;
+  // WebGPU @builtin(position).y is y-from-top, but the conic cross-term was derived
+  // with J1.y positive (y-from-bottom convention).  Negate dy to match.
+  let d = vec2<f32>(in.position.x - in.centerPix.x, in.centerPix.y - in.position.y);
   let power = 0.5*(in.conic.x*d.x*d.x + 2.0*in.conic.y*d.x*d.y + in.conic.z*d.y*d.y);
   if (power > 8.0) { discard; }
   // alpha clamped at 0.99 as in the CUDA kernel — affects both T and w_fg
@@ -188,7 +190,7 @@ fn fsMain(in: VertexOutput) -> FragOut {
   // target 0: color accumulation (with weight) and w_fg
   out.accum = vec4<f32>(in.color.rgb * alpha_w, alpha_w);
   // target 1: log-transmittance (weight-independent, as in CUDA T = prod(1-alpha))
-  out.logT  = log(1.0 - alpha);
+  out.logT  = vec4<f32>(log(1.0 - alpha), 0.0, 0.0, 0.0);
   return out;
 }
 `;
@@ -308,9 +310,9 @@ export class WebGPUSplatRenderer {
             },
           },
           {
-            // log-transmittance: accumulate log(1-alpha) additively
-            // clear=0 → T=exp(0)=1; each splat contributes negative value → T→0
-            format: "r16float",
+            // log-transmittance: accumulate log(1-alpha) additively into .r channel
+            // rgba16float used (not r16float) to guarantee blend support on all platforms
+            format: "rgba16float",
             blend: {
               color: { srcFactor: "one", dstFactor: "one", operation: "add" },
               alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
@@ -378,7 +380,7 @@ export class WebGPUSplatRenderer {
     });
     this.logTTexture = this.device.createTexture({
       size: [width, height],
-      format: "r16float",
+      format: "rgba16float",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.accumView = this.accumTexture.createView();
