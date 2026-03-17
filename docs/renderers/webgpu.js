@@ -1,4 +1,4 @@
-import { splitOpacityPhiWeights } from "./opacity_phi.js";
+import { packRowsToRGBA, splitOpacityPhiWeights } from "./opacity_phi.js";
 
 const GEOM_FLOATS = 11;
 const SH_FLOATS = 12;
@@ -7,6 +7,10 @@ const INPUT_DIM = 22;
 const HIDDEN0 = 256;
 const HIDDEN1 = 128;
 const HIDDEN2 = 64;
+const INPUT_BLOCKS = 6;
+const HIDDEN0_BLOCKS = HIDDEN0 / 4;
+const HIDDEN1_BLOCKS = HIDDEN1 / 4;
+const HIDDEN2_BLOCKS = HIDDEN2 / 4;
 const B0_OFFSET = 0;
 const B1_OFFSET = B0_OFFSET + HIDDEN0;
 const B2_OFFSET = B1_OFFSET + HIDDEN1;
@@ -36,11 +40,11 @@ struct NetOutputBuffer {
 @group(0) @binding(1) var shTex : texture_2d<f32>;
 @group(0) @binding(2) var<storage, read> geom : ScalarBuffer;
 @group(0) @binding(3) var<storage, read_write> netOut : NetOutputBuffer;
-@group(0) @binding(4) var<storage, read> w0 : ScalarBuffer;
-@group(0) @binding(5) var<storage, read> w1 : ScalarBuffer;
-@group(0) @binding(6) var<storage, read> w2 : ScalarBuffer;
-@group(0) @binding(7) var<storage, read> wPhi : ScalarBuffer;
-@group(0) @binding(8) var<storage, read> wOpacity : ScalarBuffer;
+@group(0) @binding(4) var w0Tex : texture_2d<f32>;
+@group(0) @binding(5) var w1Tex : texture_2d<f32>;
+@group(0) @binding(6) var w2Tex : texture_2d<f32>;
+@group(0) @binding(7) var wPhiTex : texture_2d<f32>;
+@group(0) @binding(8) var wOpacityTex : texture_2d<f32>;
 @group(0) @binding(9) var<storage, read> biases : ScalarBuffer;
 
 fn getGeom(index : u32, component : u32) -> f32 {
@@ -50,6 +54,10 @@ fn getGeom(index : u32, component : u32) -> f32 {
 fn getSHTexel(index : u32, texel : u32) -> vec4<f32> {
   let g = index * 3u + texel;
   return textureLoad(shTex, vec2<i32>(i32(g % ${SH_TEX_WIDTH}u), i32(g / ${SH_TEX_WIDTH}u)), 0);
+}
+
+fn getWeightTexel(tex : texture_2d<f32>, row : u32, block : u32) -> vec4<f32> {
+  return textureLoad(tex, vec2<i32>(i32(block), i32(row)), 0);
 }
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
@@ -63,28 +71,16 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let sh1 = getSHTexel(index, 1u);
   let sh2 = getSHTexel(index, 2u);
 
-  var input : array<f32, ${INPUT_DIM}>;
-  input[0] = sh0.x;
-  input[1] = sh0.y;
-  input[2] = sh0.z;
-  input[3] = sh0.w;
-  input[4] = sh1.x;
-  input[5] = sh1.y;
-  input[6] = sh1.z;
-  input[7] = sh1.w;
-  input[8] = sh2.x;
-  input[9] = sh2.y;
-  input[10] = sh2.z;
-  input[11] = sh2.w;
-
+  var input : array<vec4<f32>, ${INPUT_BLOCKS}>;
+  input[0] = sh0;
+  input[1] = sh1;
+  input[2] = sh2;
   var shNormSq = 0.0;
-  for (var i = 0u; i < 12u; i = i + 1u) {
-    shNormSq = shNormSq + input[i] * input[i];
-  }
+  shNormSq = dot(input[0], input[0]) + dot(input[1], input[1]) + dot(input[2], input[2]);
   let shInvNorm = inverseSqrt(max(shNormSq, 1e-8));
-  for (var i = 0u; i < 12u; i = i + 1u) {
-    input[i] = input[i] * shInvNorm;
-  }
+  input[0] = input[0] * shInvNorm;
+  input[1] = input[1] * shInvNorm;
+  input[2] = input[2] * shInvNorm;
 
   let pos = vec3<f32>(getGeom(index, 0u), getGeom(index, 1u), getGeom(index, 2u));
   let quat = vec4<f32>(getGeom(index, 4u), getGeom(index, 5u), getGeom(index, 6u), getGeom(index, 7u));
@@ -92,49 +88,61 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let viewdir = normalize(pos - camera.eye.xyz);
   let scaleNorm = normalize(scale);
 
-  input[12] = viewdir.x;
-  input[13] = viewdir.y;
-  input[14] = viewdir.z;
-  input[15] = scaleNorm.x;
-  input[16] = scaleNorm.y;
-  input[17] = scaleNorm.z;
-  input[18] = quat.x;
-  input[19] = quat.y;
-  input[20] = quat.z;
-  input[21] = quat.w;
+  input[3] = vec4<f32>(viewdir.x, viewdir.y, viewdir.z, scaleNorm.x);
+  input[4] = vec4<f32>(scaleNorm.y, scaleNorm.z, quat.x, quat.y);
+  input[5] = vec4<f32>(quat.z, quat.w, 0.0, 0.0);
 
   var layer0 : array<f32, ${HIDDEN0}>;
   for (var row = 0u; row < ${HIDDEN0}u; row = row + 1u) {
     var sum = biases.values[${B0_OFFSET}u + row];
-    for (var col = 0u; col < ${INPUT_DIM}u; col = col + 1u) {
-      sum = sum + w0.values[row * ${INPUT_DIM}u + col] * input[col];
+    for (var block = 0u; block < ${INPUT_BLOCKS}u; block = block + 1u) {
+      sum = sum + dot(getWeightTexel(w0Tex, row, block), input[block]);
     }
     layer0[row] = max(sum, 0.0);
+  }
+
+  var layer0Vec : array<vec4<f32>, ${HIDDEN0_BLOCKS}>;
+  for (var block = 0u; block < ${HIDDEN0_BLOCKS}u; block = block + 1u) {
+    let base = block * 4u;
+    layer0Vec[block] = vec4<f32>(layer0[base], layer0[base + 1u], layer0[base + 2u], layer0[base + 3u]);
   }
 
   var layer1 : array<f32, ${HIDDEN1}>;
   for (var row = 0u; row < ${HIDDEN1}u; row = row + 1u) {
     var sum = biases.values[${B1_OFFSET}u + row];
-    for (var col = 0u; col < ${HIDDEN0}u; col = col + 1u) {
-      sum = sum + w1.values[row * ${HIDDEN0}u + col] * layer0[col];
+    for (var block = 0u; block < ${HIDDEN0_BLOCKS}u; block = block + 1u) {
+      sum = sum + dot(getWeightTexel(w1Tex, row, block), layer0Vec[block]);
     }
     layer1[row] = max(sum, 0.0);
+  }
+
+  var layer1Vec : array<vec4<f32>, ${HIDDEN1_BLOCKS}>;
+  for (var block = 0u; block < ${HIDDEN1_BLOCKS}u; block = block + 1u) {
+    let base = block * 4u;
+    layer1Vec[block] = vec4<f32>(layer1[base], layer1[base + 1u], layer1[base + 2u], layer1[base + 3u]);
   }
 
   var layer2 : array<f32, ${HIDDEN2}>;
   for (var row = 0u; row < ${HIDDEN2}u; row = row + 1u) {
     var sum = biases.values[${B2_OFFSET}u + row];
-    for (var col = 0u; col < ${HIDDEN1}u; col = col + 1u) {
-      sum = sum + w2.values[row * ${HIDDEN1}u + col] * layer1[col];
+    for (var block = 0u; block < ${HIDDEN1_BLOCKS}u; block = block + 1u) {
+      sum = sum + dot(getWeightTexel(w2Tex, row, block), layer1Vec[block]);
     }
     layer2[row] = max(sum, 0.0);
   }
 
+  var layer2Vec : array<vec4<f32>, ${HIDDEN2_BLOCKS}>;
+  for (var block = 0u; block < ${HIDDEN2_BLOCKS}u; block = block + 1u) {
+    let base = block * 4u;
+    layer2Vec[block] = vec4<f32>(layer2[base], layer2[base + 1u], layer2[base + 2u], layer2[base + 3u]);
+  }
+
   var phiValue = biases.values[${BPHI_OFFSET}u];
   var opacityValue = biases.values[${BOPACITY_OFFSET}u];
-  for (var col = 0u; col < ${HIDDEN2}u; col = col + 1u) {
-    phiValue = phiValue + wPhi.values[col] * layer2[col];
-    opacityValue = opacityValue + wOpacity.values[col] * layer2[col];
+  for (var block = 0u; block < ${HIDDEN2_BLOCKS}u; block = block + 1u) {
+    let activations = layer2Vec[block];
+    phiValue = phiValue + dot(getWeightTexel(wPhiTex, 0u, block), activations);
+    opacityValue = opacityValue + dot(getWeightTexel(wOpacityTex, 0u, block), activations);
   }
 
   netOut.values[index] = vec2<f32>(max(phiValue, 0.0), 1.0 / (1.0 + exp(-opacityValue)));
@@ -345,6 +353,21 @@ function createStorageBuffer(device, data, usage = GPUBufferUsage.STORAGE | GPUB
   return buffer;
 }
 
+function createFloatTexture(device, width, height, data) {
+  const texture = device.createTexture({
+    size: [width, height],
+    format: "rgba32float",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  device.queue.writeTexture(
+    { texture },
+    data,
+    { offset: 0, bytesPerRow: width * 16, rowsPerImage: height },
+    { width, height },
+  );
+  return texture;
+}
+
 export class WebGPUSplatRenderer {
   static async create(canvas, scene) {
     if (!navigator.gpu || !scene.opacityPhi) return null;
@@ -417,11 +440,16 @@ export class WebGPUSplatRenderer {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
-    this.w0Buffer = createStorageBuffer(device, this.netLayout.w0);
-    this.w1Buffer = createStorageBuffer(device, this.netLayout.w1);
-    this.w2Buffer = createStorageBuffer(device, this.netLayout.w2);
-    this.wPhiBuffer = createStorageBuffer(device, this.netLayout.wPhi);
-    this.wOpacityBuffer = createStorageBuffer(device, this.netLayout.wOpacity);
+    const w0 = packRowsToRGBA(this.netLayout.w0, HIDDEN0, INPUT_DIM);
+    const w1 = packRowsToRGBA(this.netLayout.w1, HIDDEN1, HIDDEN0);
+    const w2 = packRowsToRGBA(this.netLayout.w2, HIDDEN2, HIDDEN1);
+    const wPhi = packRowsToRGBA(this.netLayout.wPhi, 1, HIDDEN2);
+    const wOpacity = packRowsToRGBA(this.netLayout.wOpacity, 1, HIDDEN2);
+    this.w0Texture = createFloatTexture(device, w0.texWidth, HIDDEN0, w0.packed);
+    this.w1Texture = createFloatTexture(device, w1.texWidth, HIDDEN1, w1.packed);
+    this.w2Texture = createFloatTexture(device, w2.texWidth, HIDDEN2, w2.packed);
+    this.wPhiTexture = createFloatTexture(device, wPhi.texWidth, 1, wPhi.packed);
+    this.wOpacityTexture = createFloatTexture(device, wOpacity.texWidth, 1, wOpacity.packed);
     const biasData = new Float32Array(BOPACITY_OFFSET + 1);
     biasData.set(this.netLayout.b0, B0_OFFSET);
     biasData.set(this.netLayout.b1, B1_OFFSET);
@@ -440,11 +468,11 @@ export class WebGPUSplatRenderer {
         { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "float" } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "unfilterable-float" } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "unfilterable-float" } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "unfilterable-float" } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "unfilterable-float" } },
+        { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "unfilterable-float" } },
         { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     });
@@ -556,11 +584,11 @@ export class WebGPUSplatRenderer {
         { binding: 1, resource: this.shTexture.createView() },
         { binding: 2, resource: { buffer: this.instanceBuffer } },
         { binding: 3, resource: { buffer: this.netOutBuffer } },
-        { binding: 4, resource: { buffer: this.w0Buffer } },
-        { binding: 5, resource: { buffer: this.w1Buffer } },
-        { binding: 6, resource: { buffer: this.w2Buffer } },
-        { binding: 7, resource: { buffer: this.wPhiBuffer } },
-        { binding: 8, resource: { buffer: this.wOpacityBuffer } },
+        { binding: 4, resource: this.w0Texture.createView() },
+        { binding: 5, resource: this.w1Texture.createView() },
+        { binding: 6, resource: this.w2Texture.createView() },
+        { binding: 7, resource: this.wPhiTexture.createView() },
+        { binding: 8, resource: this.wOpacityTexture.createView() },
         { binding: 9, resource: { buffer: this.biasBuffer } },
       ],
     });
