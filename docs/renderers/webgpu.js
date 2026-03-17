@@ -102,8 +102,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   input[19] = quat.y;
   input[20] = quat.z;
   input[21] = quat.w;
-  input[22] = 0.0;
-  input[23] = 0.0;
 
   var layer0 : array<f32, ${HIDDEN0}>;
   for (var row = 0u; row < ${HIDDEN0}u; row = row + 1u) {
