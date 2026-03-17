@@ -16,10 +16,15 @@ const rendererSelect = document.querySelector("#renderer-select");
 const alphaControl = document.querySelector("#alpha-control");
 const autorotateControl = document.querySelector("#autorotate-control");
 const fpsCounter = document.querySelector("#fps-counter");
+const referenceTriggers = document.querySelectorAll(".reference-trigger");
+const lightbox = document.querySelector("#lightbox");
+const lightboxClose = document.querySelector("#lightbox-close");
+const lightboxTitle = document.querySelector("#lightbox-title");
+const lightboxImage = document.querySelector("#lightbox-image");
 
-// Binary format v5: geometry (11 f32/splat) + SH (48 f16/splat)
+// Geometry: 11 f32/splat. SH payload varies by manifest version.
 const GEOM_FLOATS = 11;   // geometry: pos/opacity/quat/scale (origIdx removed, use instance ID)
-const SH_FLOATS = 48;     // SH: sh_r[16] sh_g[16] sh_b[16], stored as float16
+const SH_FLOATS = 48;     // legacy v5 fallback: SH3 channel-major payload
 
 const state = {
   scene: null,
@@ -344,6 +349,43 @@ function bindControls() {
     const scale = Math.exp(event.deltaY * 0.001);
     state.camera.distance = clamp(state.camera.distance * scale, 0.8, 20.0);
   }, { passive: false });
+
+  for (const trigger of referenceTriggers) {
+    trigger.addEventListener("click", () => {
+      openLightbox(
+        trigger.dataset.lightboxSrc,
+        trigger.dataset.lightboxAlt,
+        trigger.dataset.lightboxTitle,
+      );
+    });
+  }
+
+  lightboxClose.addEventListener("click", closeLightbox);
+  lightbox.addEventListener("click", (event) => {
+    if (event.target instanceof HTMLElement && event.target.dataset.lightboxClose === "true") {
+      closeLightbox();
+    }
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !lightbox.hidden) {
+      closeLightbox();
+    }
+  });
+}
+
+function openLightbox(src, alt, title) {
+  lightboxImage.src = src;
+  lightboxImage.alt = alt;
+  lightboxTitle.textContent = title;
+  lightbox.hidden = false;
+  document.body.style.overflow = "hidden";
+  lightboxClose.focus();
+}
+
+function closeLightbox() {
+  lightbox.hidden = true;
+  lightboxImage.removeAttribute("src");
+  document.body.style.overflow = "";
 }
 
 // ---------------------------------------------------------------------------
@@ -356,10 +398,15 @@ async function loadScene() {
   const buffer = await fetch(binaryUrl).then((r) => r.arrayBuffer());
   manifest.binaryUrl = binaryUrl;
   const N = manifest.splatCount;
-  // Split into two separate ArrayBuffers so each can be transferred independently
+  const shFloats = (manifest.shCoefficientsPerChannel ?? 16) * 3;
   manifest.geomSplats = new Float32Array(buffer.slice(0, N * GEOM_FLOATS * 4));
-  // SH stored as float16 (2 bytes each) in v5; pass raw uint16 bits to renderers
-  manifest.shSplats = new Uint16Array(buffer.slice(N * GEOM_FLOATS * 4));
+  manifest.shSplats = new Uint16Array(buffer.slice(N * GEOM_FLOATS * 4, N * GEOM_FLOATS * 4 + N * shFloats * 2));
+  manifest.shFloats = shFloats;
+  if (manifest.opacityPhi?.binary) {
+    const opacityPhiUrl = new URL(manifest.opacityPhi.binary, new URL(SCENE_MANIFEST_URL, window.location.href)).toString();
+    manifest.opacityPhiUrl = opacityPhiUrl;
+    manifest.opacityPhiWeights = new Float32Array(await fetch(opacityPhiUrl).then((r) => r.arrayBuffer()));
+  }
   return manifest;
 }
 

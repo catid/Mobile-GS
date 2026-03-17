@@ -85,6 +85,7 @@ class Scene:
             if decode:
                 gaussians.active_sh_degree = args.sh_degree
                 gaussians.construct_net(train=False)
+                gaussians.init_vnn()
                 save_dict = load_comp(args.model_path + "/comp.xz")
                 gaussians.decode(save_dict, path=self.model_path)
             else:
@@ -99,8 +100,11 @@ class Scene:
                     "iteration_" + str(self.loaded_iter),
                     "opacity_phi_nn.pt",
                 )
-                if self.gaussians.opacity_phi_nn is not None and os.path.exists(opacity_phi_path):
+                if os.path.exists(opacity_phi_path):
+                    if self.gaussians.opacity_phi_nn is None:
+                        self.gaussians.init_vnn()
                     self.gaussians.opacity_phi_nn.load_state_dict(torch.load(opacity_phi_path, weights_only=True))
+                    self.gaussians.opacity_phi_nn = self.gaussians.opacity_phi_nn.eval().cuda()
 
                 w_bg_path = os.path.join(self.model_path, 'w_bg.pth')
                 if getattr(self.gaussians, "w_bg", None) is not None and os.path.exists(w_bg_path):
@@ -111,6 +115,7 @@ class Scene:
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.gaussians.save_opacity_phi_nn(os.path.join(point_cloud_path, "opacity_phi_nn.pt"))
         
 
     def getTrainCameras(self, scale=1.0):

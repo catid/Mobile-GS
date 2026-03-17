@@ -56,6 +56,7 @@ def parse_args():
     parser.add_argument("--height", type=int, default=320)
     parser.add_argument("--distance-scale", type=float, default=1.0)
     parser.add_argument("--sh-degree", type=int, default=3)
+    parser.add_argument("--opacity-phi", type=Path)
     return parser.parse_args()
 
 
@@ -102,8 +103,14 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    gaussians = GaussianModel(args.sh_degree)
+    sh_degree = int(manifest.get("shDegree", args.sh_degree))
+    gaussians = GaussianModel(sh_degree)
     gaussians.load_ply(str(args.ply))
+    opacity_phi_path = args.opacity_phi or args.ply.with_name("opacity_phi_nn.pt")
+    if opacity_phi_path.exists():
+        gaussians.init_vnn()
+        gaussians.opacity_phi_nn.load_state_dict(torch.load(opacity_phi_path, map_location="cpu", weights_only=True))
+        gaussians.opacity_phi_nn = gaussians.opacity_phi_nn.eval().cuda()
 
     pipe = SimpleNamespace(
         compute_cov3D_python=False,

@@ -375,9 +375,28 @@ class GaussianModel:
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         if self.net_enabled:
-            # _features_dc is stale after construct_net; use _features_static (shape N,3)
-            f_dc = self._features_static.detach().cpu().numpy()
-            f_rest = np.zeros((xyz.shape[0], self._features_rest.shape[1] * self._features_rest.shape[2]), dtype=np.float32)
+            # Export decoded SH features so intermediate checkpoints after the
+            # 35k network handoff remain renderable outside the training loop.
+            with torch.no_grad():
+                cont_feature = self.mlp_cont(
+                    self.contract_to_unisphere(
+                        self.get_xyz.clone().detach(),
+                        torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device="cuda"),
+                    )
+                )
+                if self.vq_enabled:
+                    app_feature = self.get_svq_appearance
+                    space_feature = torch.cat([cont_feature, app_feature[:, 0:3]], dim=-1)
+                    view_feature = torch.cat([cont_feature, app_feature[:, 3:6]], dim=-1)
+                else:
+                    space_feature = torch.cat([cont_feature, self._features_static], dim=-1)
+                    view_feature = torch.cat([cont_feature, self._features_view], dim=-1)
+
+                decoded_dc = self.mlp_dc(space_feature).reshape(-1, 1, 3).float()
+                decoded_rest = self.mlp_view(view_feature).reshape(-1, self.max_sh_rest, 3).float()
+
+            f_dc = decoded_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+            f_rest = decoded_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         else:
             f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
             f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
@@ -393,6 +412,12 @@ class GaussianModel:
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+
+    def save_opacity_phi_nn(self, path):
+        if self.opacity_phi_nn is None:
+            return
+        mkdir_p(os.path.dirname(path))
+        torch.save(self.opacity_phi_nn.state_dict(), path)
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -505,6 +530,14 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+        if self.vq_enabled:
+            for i in range(len(self.scale_indices)):
+                self.scale_indices[i] = self.scale_indices[i][valid_points_mask]
+            for i in range(len(self.rotation_indices)):
+                self.rotation_indices[i] = self.rotation_indices[i][valid_points_mask]
+            for i in range(len(self.appearance_indices)):
+                self.appearance_indices[i] = self.appearance_indices[i][valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -827,6 +860,7 @@ class GaussianModel:
         self.prune_points(non_prune_mask==False)
         
     def construct_net(self, train=True):
+        self.ensure_consistent_counts()
 
         self.mlp_cont = tcnn.NetworkWithInputEncoding(
             n_input_dims=3,
@@ -924,6 +958,55 @@ class GaussianModel:
                 self.appearance_indices[i] = self.appearance_indices[i][order]
         return
 
+    def ensure_consistent_counts(self):
+        counts = [
+            self._xyz.shape[0],
+            self._scaling.shape[0],
+            self._rotation.shape[0],
+            self._opacity.shape[0],
+        ]
+        if self.net_enabled:
+            counts.extend([self._features_static.shape[0], self._features_view.shape[0]])
+        else:
+            counts.extend([self._features_dc.shape[0], self._features_rest.shape[0]])
+
+        valid_counts = [count for count in counts if count > 0]
+        if not valid_counts:
+            return
+
+        target = min(valid_counts)
+        if all(count == target for count in valid_counts):
+            return
+
+        self._xyz = nn.Parameter(self._xyz[:target], requires_grad=True)
+        self._scaling = nn.Parameter(self._scaling[:target], requires_grad=True)
+        self._rotation = nn.Parameter(self._rotation[:target], requires_grad=True)
+        self._opacity = nn.Parameter(self._opacity[:target], requires_grad=True)
+
+        if self.net_enabled:
+            self._features_static = nn.Parameter(self._features_static[:target], requires_grad=True)
+            self._features_view = nn.Parameter(self._features_view[:target], requires_grad=True)
+        else:
+            self._features_dc = nn.Parameter(self._features_dc[:target], requires_grad=True)
+            self._features_rest = nn.Parameter(self._features_rest[:target], requires_grad=True)
+
+        if self.max_radii2D.numel() >= target:
+            self.max_radii2D = self.max_radii2D[:target]
+        if self.xyz_gradient_accum.numel() >= target:
+            self.xyz_gradient_accum = self.xyz_gradient_accum[:target]
+        if self.denom.numel() >= target:
+            self.denom = self.denom[:target]
+
+        if getattr(self, "scale_indices", None):
+            for i in range(len(self.scale_indices)):
+                self.scale_indices[i] = self.scale_indices[i][:target]
+        if getattr(self, "rotation_indices", None):
+            for i in range(len(self.rotation_indices)):
+                self.rotation_indices[i] = self.rotation_indices[i][:target]
+        if getattr(self, "appearance_indices", None):
+            for i in range(len(self.appearance_indices)):
+                self.appearance_indices[i] = self.appearance_indices[i][:target]
+
     def prune(self, prune_method, threshold):
         if prune_method == "opacity":
             prune_mask = (self.get_opacity < threshold).squeeze()
@@ -958,6 +1041,7 @@ class GaussianModel:
             return x
 
     def apply_svq(self, args):
+        self.ensure_consistent_counts()
         self.scale_codes = []
         self.scale_indices = []
         self.rotation_codes = []
@@ -1004,8 +1088,10 @@ class GaussianModel:
             labels = kmeans.fit_predict(input_cp)
             cluster_centers = kmeans.cluster_centers_
 
-            codebook = torch.nn.Parameter(torch.from_dlpack(cluster_centers)).cuda()
-            index = torch.from_dlpack(labels).cuda().long()
+            codebook = torch.nn.Parameter(
+                torch.as_tensor(cp.asnumpy(cp.asarray(cluster_centers)), device="cuda", dtype=torch.float32)
+            )
+            index = torch.as_tensor(cp.asnumpy(cp.asarray(labels)), device="cuda", dtype=torch.long)
 
             code_list.append(codebook)
             index_list.append(index)

@@ -66,7 +66,7 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
-        self.mv = 1    # MVGS multi-view training
+        self.mv = 3
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -94,7 +94,7 @@ class OptimizationParams(ParamGroup):
         self.num_max = 4_500_000
         self.depth_reinit_interval = 5_000
         self.sampling_factor = 0.5
-        self.svq_itr = 59_000
+        self.svq_itr = 35_000
         self.net_itr = 35_000
         self.importance_thresh = 0.96
         self.lambda_ld = 2.0

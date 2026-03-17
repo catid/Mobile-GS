@@ -99,6 +99,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
+        if iteration == args.net_itr:
+            current_opt_dict = gaussians.optimizer.state_dict()
+
+            gaussians.construct_net()
+            gaussians.training_setup(opt)
+
+            current_opt_dict = gaussians.filter_optimizer_state_net(current_opt_dict)
+            gaussians.optimizer.load_state_dict(current_opt_dict)
+
         total_loss = 0
 
         opacity=None
@@ -136,7 +145,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1_depth = scale_invariant_loss(render_pkg["render_depth"], depth_teacher, mask=None)
             Ll1_distill = l1_loss(image, img_teacher)
             loss = loss + opt.lambda_distill * Ll1_distill + opt.lambda_depth * Ll1_depth
-            loss = loss + opt.lambda_depth * Ll1_depth
 
 
             total_loss += loss
@@ -209,16 +217,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                           " pruned points:", prune_number.item())
                     low_opacity_mask = torch.zeros((len(gaussians._xyz), 1), device='cuda')
                     low_opacity_scale_mask = torch.zeros((len(gaussians._xyz), 1), device='cuda')
-
-            if iteration == args.net_itr:
-                current_opt_dict = gaussians.optimizer.state_dict()
-
-                gaussians.construct_net()
-                gaussians.training_setup(opt)
-
-                current_opt_dict = gaussians.filter_optimizer_state_net(current_opt_dict)
-                gaussians.optimizer.load_state_dict(current_opt_dict)
-
 
             # Optimizer step
             if iteration < opt.iterations:

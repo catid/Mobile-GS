@@ -1,33 +1,143 @@
-// Mobile-GS three-pass WebGPU renderer — matches _ms CUDA blending formula (phi=0):
-//   Pass 1a: accumTexture (rgba16float): accumulate (color*alpha_w, alpha_w) additively
-//   Pass 1b: logTTexture  (rgba16float): accumulate log(1-alpha_clamped) additively
-//   Pass 2:  compose
-//   (Two separate passes instead of MRT — MRT for float targets is unreliable on some devices)
-//     w_fg     = accum.a
-//     C_fg     = accum.rgb / w_fg
-//     T        = exp(logT_accum)  -- = prod(1-alpha_i), exact transmittance
-//     coverage = 1 - T            -- matches CUDA formula exactly
-//     output   = mix(bg, C_fg, coverage)
-//   alpha = min(0.99, opacity * exp(-power) * alphaScale)  -- clamped as in CUDA
-//   weight = exp(min(max_scale/depth, 20))                 -- in color only, not T
-//
-// Uniform buffer layout (176 bytes = 44 floats):
-//   offset   0 : mat4x4  viewProj
-//   offset  64 : mat4x4  view
-//   offset 128 : vec4    viewport  (width, height, focal, 0)
-//   offset 144 : vec4    params    (alphaScale, 0, 0, 0)
-//   offset 160 : vec4    eye       (ex, ey, ez, 0)
-const UNIFORM_BUFFER_SIZE = 176;
+import { splitOpacityPhiWeights } from "./opacity_phi.js";
 
-// Geometry vertex buffer layout (11 floats = 44 bytes per splat, v5 format):
-//   offset  0 : vec4  posOpacity  (x, y, z, opacity)
-//   offset 16 : vec4  quat        (qw, qx, qy, qz)
-//   offset 32 : vec3  scale       (sx, sy, sz)  — origIdx removed, use instance_index
 const GEOM_FLOATS = 11;
+const SH_FLOATS = 12;
+const SH_TEX_WIDTH = 2048;
+const UNIFORM_BUFFER_SIZE = 176;
+const WORKGROUP_SIZE = 64;
 
-// ---------------------------------------------------------------------------
-// Pass 1: splat accumulation shader
-// ---------------------------------------------------------------------------
+const WGSL_NET = `
+struct CameraUniforms {
+  viewProj : mat4x4<f32>,
+  view     : mat4x4<f32>,
+  viewport : vec4<f32>,
+  params   : vec4<f32>,
+  eye      : vec4<f32>,
+};
+
+struct ScalarBuffer {
+  values : array<f32>,
+};
+
+struct NetOutputBuffer {
+  values : array<vec2<f32>>,
+};
+
+@group(0) @binding(0) var<uniform> camera : CameraUniforms;
+@group(0) @binding(1) var shTex : texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> geom : ScalarBuffer;
+@group(0) @binding(3) var<storage, read_write> netOut : NetOutputBuffer;
+@group(0) @binding(4) var<storage, read> w0 : ScalarBuffer;
+@group(0) @binding(5) var<storage, read> b0 : ScalarBuffer;
+@group(0) @binding(6) var<storage, read> w1 : ScalarBuffer;
+@group(0) @binding(7) var<storage, read> b1 : ScalarBuffer;
+@group(0) @binding(8) var<storage, read> w2 : ScalarBuffer;
+@group(0) @binding(9) var<storage, read> b2 : ScalarBuffer;
+@group(0) @binding(10) var<storage, read> wPhi : ScalarBuffer;
+@group(0) @binding(11) var<storage, read> bPhi : ScalarBuffer;
+@group(0) @binding(12) var<storage, read> wOpacity : ScalarBuffer;
+@group(0) @binding(13) var<storage, read> bOpacity : ScalarBuffer;
+
+fn getGeom(index : u32, component : u32) -> f32 {
+  return geom.values[index * 11u + component];
+}
+
+fn getSHTexel(index : u32, texel : u32) -> vec4<f32> {
+  let g = index * 3u + texel;
+  return textureLoad(shTex, vec2<i32>(i32(g % ${SH_TEX_WIDTH}u), i32(g / ${SH_TEX_WIDTH}u)), 0);
+}
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let index = gid.x;
+  if (index >= arrayLength(&netOut.values)) {
+    return;
+  }
+
+  let sh0 = getSHTexel(index, 0u);
+  let sh1 = getSHTexel(index, 1u);
+  let sh2 = getSHTexel(index, 2u);
+
+  var input : array<f32, 24>;
+  input[0] = sh0.x;
+  input[1] = sh0.y;
+  input[2] = sh0.z;
+  input[3] = sh0.w;
+  input[4] = sh1.x;
+  input[5] = sh1.y;
+  input[6] = sh1.z;
+  input[7] = sh1.w;
+  input[8] = sh2.x;
+  input[9] = sh2.y;
+  input[10] = sh2.z;
+  input[11] = sh2.w;
+
+  var shNormSq = 0.0;
+  for (var i = 0u; i < 12u; i = i + 1u) {
+    shNormSq = shNormSq + input[i] * input[i];
+  }
+  let shInvNorm = inverseSqrt(max(shNormSq, 1e-8));
+  for (var i = 0u; i < 12u; i = i + 1u) {
+    input[i] = input[i] * shInvNorm;
+  }
+
+  let pos = vec3<f32>(getGeom(index, 0u), getGeom(index, 1u), getGeom(index, 2u));
+  let quat = vec4<f32>(getGeom(index, 4u), getGeom(index, 5u), getGeom(index, 6u), getGeom(index, 7u));
+  let scale = vec3<f32>(getGeom(index, 8u), getGeom(index, 9u), getGeom(index, 10u));
+  let viewdir = normalize(pos - camera.eye.xyz);
+  let scaleNorm = normalize(scale);
+
+  input[12] = viewdir.x;
+  input[13] = viewdir.y;
+  input[14] = viewdir.z;
+  input[15] = scaleNorm.x;
+  input[16] = scaleNorm.y;
+  input[17] = scaleNorm.z;
+  input[18] = quat.x;
+  input[19] = quat.y;
+  input[20] = quat.z;
+  input[21] = quat.w;
+  input[22] = 0.0;
+  input[23] = 0.0;
+
+  var layer0 : array<f32, 256>;
+  for (var row = 0u; row < 256u; row = row + 1u) {
+    var sum = b0.values[row];
+    for (var col = 0u; col < 22u; col = col + 1u) {
+      sum = sum + w0.values[row * 22u + col] * input[col];
+    }
+    layer0[row] = max(sum, 0.0);
+  }
+
+  var layer1 : array<f32, 128>;
+  for (var row = 0u; row < 128u; row = row + 1u) {
+    var sum = b1.values[row];
+    for (var col = 0u; col < 256u; col = col + 1u) {
+      sum = sum + w1.values[row * 256u + col] * layer0[col];
+    }
+    layer1[row] = max(sum, 0.0);
+  }
+
+  var layer2 : array<f32, 64>;
+  for (var row = 0u; row < 64u; row = row + 1u) {
+    var sum = b2.values[row];
+    for (var col = 0u; col < 128u; col = col + 1u) {
+      sum = sum + w2.values[row * 128u + col] * layer1[col];
+    }
+    layer2[row] = max(sum, 0.0);
+  }
+
+  var phiValue = bPhi.values[0];
+  var opacityValue = bOpacity.values[0];
+  for (var col = 0u; col < 64u; col = col + 1u) {
+    phiValue = phiValue + wPhi.values[col] * layer2[col];
+    opacityValue = opacityValue + wOpacity.values[col] * layer2[col];
+  }
+
+  netOut.values[index] = vec2<f32>(max(phiValue, 0.0), 1.0 / (1.0 + exp(-opacityValue)));
+}
+`;
+
 const WGSL_SPLAT = `
 struct CameraUniforms {
   viewProj : mat4x4<f32>,
@@ -37,199 +147,200 @@ struct CameraUniforms {
   eye      : vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> camera : CameraUniforms;
-// SH stored as rgba16float texture: width=2048, each splat occupies 12 texels (4 f16 each)
-@group(0) @binding(1) var shTex : texture_2d<f32>;
-
-struct VertexOutput {
-  @builtin(position) position  : vec4<f32>,
-  @location(0)       conic     : vec3<f32>,
-  @location(1)       centerPix : vec2<f32>,
-  @location(2)       color     : vec4<f32>,  // rgb=SH color, a=opacity
-  @location(3)       weight    : f32,         // exp(min(max_scale/depth, 20))
+struct NetOutputBuffer {
+  values : array<vec2<f32>>,
 };
 
-// Two separate fragment entry points (no MRT)
+@group(0) @binding(0) var<uniform> camera : CameraUniforms;
+@group(0) @binding(1) var shTex : texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> netOut : NetOutputBuffer;
+
+struct VertexOutput {
+  @builtin(position) position : vec4<f32>,
+  @location(0) conic : vec3<f32>,
+  @location(1) centerPix : vec2<f32>,
+  @location(2) color : vec4<f32>,
+  @location(3) weight : f32,
+};
 
 const quad = array<vec2<f32>, 6>(
-  vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
-  vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0),
+  vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+  vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
 );
 
-fn quatToMat(q: vec4<f32>) -> mat3x3<f32> {
-  let qw = q.x; let qx = q.y; let qy = q.z; let qz = q.w;
+fn quatToMat(q : vec4<f32>) -> mat3x3<f32> {
+  let qw = q.x;
+  let qx = q.y;
+  let qy = q.z;
+  let qz = q.w;
   return mat3x3<f32>(
-    vec3<f32>(1.0-2.0*(qy*qy+qz*qz), 2.0*(qx*qy+qw*qz), 2.0*(qx*qz-qw*qy)),
-    vec3<f32>(2.0*(qx*qy-qw*qz), 1.0-2.0*(qx*qx+qz*qz), 2.0*(qy*qz+qw*qx)),
-    vec3<f32>(2.0*(qx*qz+qw*qy), 2.0*(qy*qz-qw*qx), 1.0-2.0*(qx*qx+qy*qy)),
+    vec3<f32>(1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy + qw * qz), 2.0 * (qx * qz - qw * qy)),
+    vec3<f32>(2.0 * (qx * qy - qw * qz), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz + qw * qx)),
+    vec3<f32>(2.0 * (qx * qz + qw * qy), 2.0 * (qy * qz - qw * qx), 1.0 - 2.0 * (qx * qx + qy * qy)),
   );
 }
 
-// group=0..11: each splat has 12 texels of 4 f16 values = 48 SH coefficients
-fn getSH(origIdx: u32, group: u32) -> vec4<f32> {
-  let g = origIdx * 12u + group;
-  return textureLoad(shTex, vec2<i32>(i32(g % 2048u), i32(g / 2048u)), 0);
+fn getSHTexel(index : u32, texel : u32) -> vec4<f32> {
+  let g = index * 3u + texel;
+  return textureLoad(shTex, vec2<i32>(i32(g % ${SH_TEX_WIDTH}u), i32(g / ${SH_TEX_WIDTH}u)), 0);
 }
 
-fn evalSH3(dir: vec3<f32>,
-    r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32>, r3: vec4<f32>,
-    g0: vec4<f32>, g1: vec4<f32>, g2: vec4<f32>, g3: vec4<f32>,
-    b0: vec4<f32>, b1: vec4<f32>, b2: vec4<f32>, b3: vec4<f32>,
-) -> vec3<f32> {
-  let x = dir.x; let y = dir.y; let z = dir.z;
-  var col = vec3<f32>(r0.x, g0.x, b0.x) * 0.28209479177387814;
-  let c1 = 0.4886025119029199;
-  col += vec3<f32>(r0.y, g0.y, b0.y) * (c1 * (-y));
-  col += vec3<f32>(r0.z, g0.z, b0.z) * (c1 * z);
-  col += vec3<f32>(r0.w, g0.w, b0.w) * (c1 * (-x));
-  let xx = x*x; let yy = y*y; let zz = z*z;
-  let xy = x*y; let yz = y*z; let xz = x*z;
-  col += vec3<f32>(r1.x, g1.x, b1.x) * ( 1.0925484305920792 * xy);
-  col += vec3<f32>(r1.y, g1.y, b1.y) * (-1.0925484305920792 * yz);
-  col += vec3<f32>(r1.z, g1.z, b1.z) * ( 0.31539156525252005 * (2.0*zz-xx-yy));
-  col += vec3<f32>(r1.w, g1.w, b1.w) * (-1.0925484305920792 * xz);
-  col += vec3<f32>(r2.x, g2.x, b2.x) * ( 0.5462742152960396 * (xx-yy));
-  col += vec3<f32>(r2.y, g2.y, b2.y) * (-0.5900435899266435 * y * (3.0*xx-yy));
-  col += vec3<f32>(r2.z, g2.z, b2.z) * ( 2.890611442640554  * xy * z);
-  col += vec3<f32>(r2.w, g2.w, b2.w) * (-0.4570457994644658 * y * (4.0*zz-xx-yy));
-  col += vec3<f32>(r3.x, g3.x, b3.x) * ( 0.3731763325901154 * z * (2.0*zz-3.0*xx-3.0*yy));
-  col += vec3<f32>(r3.y, g3.y, b3.y) * (-0.4570457994644658 * x * (4.0*zz-xx-yy));
-  col += vec3<f32>(r3.z, g3.z, b3.z) * ( 1.445305721320277  * z * (xx-yy));
-  col += vec3<f32>(r3.w, g3.w, b3.w) * (-0.5900435899266435 * x * (xx-3.0*yy));
-  return max(col + 0.5, vec3<f32>(0.0));
+fn evalSH1(index : u32, dir : vec3<f32>) -> vec3<f32> {
+  let t0 = getSHTexel(index, 0u);
+  let t1 = getSHTexel(index, 1u);
+  let t2 = getSHTexel(index, 2u);
+
+  let c0 = vec3<f32>(t0.x, t0.y, t0.z);
+  let c1 = vec3<f32>(t0.w, t1.x, t1.y);
+  let c2 = vec3<f32>(t1.z, t1.w, t2.x);
+  let c3 = vec3<f32>(t2.y, t2.z, t2.w);
+
+  let x = dir.x;
+  let y = dir.y;
+  let z = dir.z;
+  let c = 0.4886025119029199;
+  var color = c0 * 0.28209479177387814;
+  color = color + c1 * (c * (-y));
+  color = color + c2 * (c * z);
+  color = color + c3 * (c * (-x));
+  return max(color + 0.5, vec3<f32>(0.0));
 }
 
 @vertex
 fn vsMain(
-  @builtin(vertex_index)   vi      : u32,
+  @builtin(vertex_index) vi : u32,
   @builtin(instance_index) instIdx : u32,
   @location(0) posOpacity : vec4<f32>,
-  @location(1) quat       : vec4<f32>,
-  @location(2) scaleXYZ   : vec3<f32>,  // v5: no origIdx, use instIdx instead
+  @location(1) quat : vec4<f32>,
+  @location(2) scaleXYZ : vec3<f32>,
 ) -> VertexOutput {
-  var out: VertexOutput;
-  let pos     = posOpacity.xyz;
-  let opacity = posOpacity.w;
-  let scale   = scaleXYZ;
-  let origIdx = instIdx;
+  var out : VertexOutput;
+  let pos = posOpacity.xyz;
+  let scale = scaleXYZ;
+  let phiOpacity = netOut.values[instIdx];
+  let phi = phiOpacity.x;
+  let opacity = phiOpacity.y;
 
-  let p_view = camera.view * vec4<f32>(pos, 1.0);
-  let fwd    = -p_view.z;
-  if (fwd < 0.01) { out.position = vec4<f32>(0.0,0.0,2.0,1.0); return out; }
+  let pView = camera.view * vec4<f32>(pos, 1.0);
+  let fwd = -pView.z;
+  if (fwd < 0.01) {
+    out.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+    return out;
+  }
 
   let W = mat3x3<f32>(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
   let R = quatToMat(quat);
-  let M = mat3x3<f32>(W*(R[0]*scale.x), W*(R[1]*scale.y), W*(R[2]*scale.z));
+  let M = mat3x3<f32>(W * (R[0] * scale.x), W * (R[1] * scale.y), W * (R[2] * scale.z));
   let Sv = M * transpose(M);
 
-  let focal = camera.viewport.z;
-  let inv_d  = 1.0 / fwd;
-  let inv_d2 = inv_d * inv_d;
-  let tx = p_view.x; let ty = p_view.y;
-  let J0 = vec3<f32>(focal*inv_d, 0.0, focal*tx*inv_d2);
-  let J1 = vec3<f32>(0.0, focal*inv_d, focal*ty*inv_d2);
+  let invD = 1.0 / fwd;
+  let invD2 = invD * invD;
+  let tx = pView.x;
+  let ty = pView.y;
+  let J0 = vec3<f32>(camera.viewport.z * invD, 0.0, camera.viewport.z * tx * invD2);
+  let J1 = vec3<f32>(0.0, camera.viewport.z * invD, camera.viewport.z * ty * invD2);
 
-  var cov00 = dot(J0, Sv*J0) + 0.3;
-  let cov01 = dot(J0, Sv*J1);
-  var cov11 = dot(J1, Sv*J1) + 0.3;
-  let det = cov00*cov11 - cov01*cov01;
-  if (det <= 0.0) { out.position = vec4<f32>(0.0,0.0,2.0,1.0); return out; }
-  let inv_det = 1.0 / det;
-  let conic   = vec3<f32>(cov11*inv_det, -cov01*inv_det, cov00*inv_det);
+  let cov00 = dot(J0, Sv * J0) + 0.3;
+  let cov01 = dot(J0, Sv * J1);
+  let cov11 = dot(J1, Sv * J1) + 0.3;
+  let det = cov00 * cov11 - cov01 * cov01;
+  if (det <= 0.0) {
+    out.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+    return out;
+  }
 
-  let trace   = cov00 + cov11;
-  let disc    = max(0.0, trace*trace - 4.0*det);
-  let lambda1 = 0.5*(trace + sqrt(disc));
-  let radius  = min(3.0*sqrt(lambda1), 1024.0);
+  let invDet = 1.0 / det;
+  let conic = vec3<f32>(cov11 * invDet, -cov01 * invDet, cov00 * invDet);
+  let trace = cov00 + cov11;
+  let disc = max(0.0, trace * trace - 4.0 * det);
+  let radius = min(3.0 * sqrt(0.5 * (trace + sqrt(disc))), 1024.0);
 
-  let p_clip = camera.viewProj * vec4<f32>(pos, 1.0);
-  let inv_pw = 1.0 / p_clip.w;
-  let ndc    = p_clip.xy * inv_pw;
-  let width  = camera.viewport.x;
-  let height = camera.viewport.y;
-  let cx     = (ndc.x * 0.5 + 0.5) * width;
-  let cy     = (0.5 - ndc.y * 0.5) * height;
-
+  let clip = camera.viewProj * vec4<f32>(pos, 1.0);
+  let invW = 1.0 / clip.w;
+  let cx = (clip.x * invW * 0.5 + 0.5) * camera.viewport.x;
+  let cy = (clip.y * invW * 0.5 + 0.5) * camera.viewport.y;
   let local = quad[vi];
-  out.position  = vec4<f32>((cx + local.x*radius)/width*2.0-1.0,
-                              1.0-(cy + local.y*radius)/height*2.0,
-                              p_clip.z*inv_pw, 1.0);
-  out.conic     = conic;
+
+  out.position = vec4<f32>(
+    (cx + local.x * radius) / camera.viewport.x * 2.0 - 1.0,
+    1.0 - (cy + local.y * radius) / camera.viewport.y * 2.0,
+    clip.z * invW,
+    1.0
+  );
+  out.conic = conic;
   out.centerPix = vec2<f32>(cx, cy);
+  out.color = vec4<f32>(evalSH1(instIdx, normalize(pos - camera.eye.xyz)), opacity);
 
-  let dir = normalize(pos - camera.eye.xyz);
-  let sh_r0 = getSH(origIdx,  0u); let sh_r1 = getSH(origIdx,  1u);
-  let sh_r2 = getSH(origIdx,  2u); let sh_r3 = getSH(origIdx,  3u);
-  let sh_g0 = getSH(origIdx,  4u); let sh_g1 = getSH(origIdx,  5u);
-  let sh_g2 = getSH(origIdx,  6u); let sh_g3 = getSH(origIdx,  7u);
-  let sh_b0 = getSH(origIdx,  8u); let sh_b1 = getSH(origIdx,  9u);
-  let sh_b2 = getSH(origIdx, 10u); let sh_b3 = getSH(origIdx, 11u);
-  let rgb = evalSH3(dir, sh_r0,sh_r1,sh_r2,sh_r3, sh_g0,sh_g1,sh_g2,sh_g3, sh_b0,sh_b1,sh_b2,sh_b3);
-  out.color = vec4<f32>(rgb, opacity);
-
-  let max_scale = max(scale.x, max(scale.y, scale.z));
-  out.weight = exp(min(max_scale / fwd, 20.0));
+  let maxScale = max(scale.x, max(scale.y, scale.z));
+  out.weight = exp(min(maxScale / fwd, 20.0)) + phi / (fwd * fwd) + phi * phi;
   return out;
 }
 
-fn splatAlpha(in: VertexOutput) -> f32 {
-  // WebGPU @builtin(position).y is y-from-top; negate dy to match conic convention.
+fn splatAlpha(in : VertexOutput) -> f32 {
   let d = vec2<f32>(in.position.x - in.centerPix.x, in.centerPix.y - in.position.y);
-  let power = 0.5*(in.conic.x*d.x*d.x + 2.0*in.conic.y*d.x*d.y + in.conic.z*d.y*d.y);
-  if (power > 8.0) { return -1.0; }  // sentinel: discard
+  let power = 0.5 * (in.conic.x * d.x * d.x + 2.0 * in.conic.y * d.x * d.y + in.conic.z * d.y * d.y);
+  if (power > 8.0) {
+    return -1.0;
+  }
   return min(0.99, in.color.a * exp(-power) * camera.params.x);
 }
 
-// Pass 1a: accumulate (color*alpha_w, alpha_w) into accum target
 @fragment
-fn fsAccum(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fsAccum(in : VertexOutput) -> @location(0) vec4<f32> {
   let alpha = splatAlpha(in);
-  let alpha_w = alpha * in.weight;
-  if (alpha_w < 0.00001) { discard; }
-  return vec4<f32>(in.color.rgb * alpha_w, alpha_w);
+  let alphaWeight = alpha * in.weight;
+  if (alphaWeight < 0.00001) {
+    discard;
+  }
+  return vec4<f32>(in.color.rgb * alphaWeight, alphaWeight);
 }
 
-// Pass 1b: accumulate log(1-alpha) into logT target (separate pass — no MRT needed)
 @fragment
-fn fsLogT(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fsLogT(in : VertexOutput) -> @location(0) vec4<f32> {
   let alpha = splatAlpha(in);
-  if (alpha * in.weight < 0.00001) { discard; }
+  if (alpha < 0.00001) {
+    discard;
+  }
   return vec4<f32>(log(1.0 - alpha), 0.0, 0.0, 0.0);
 }
 `;
 
-// ---------------------------------------------------------------------------
-// Pass 2: composition shader
-// ---------------------------------------------------------------------------
 const WGSL_COMPOSE = `
 @group(0) @binding(0) var accumTex : texture_2d<f32>;
 @group(0) @binding(1) var<uniform> bgColor : vec4<f32>;
 @group(0) @binding(2) var logTTex : texture_2d<f32>;
 
 @vertex
-fn vsCompose(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-  let corners = array<vec2<f32>,3>(vec2(-1,-1), vec2(3,-1), vec2(-1,3));
-  return vec4<f32>(corners[vi], 0.0, 1.0);
+fn vsCompose(@builtin(vertex_index) index : u32) -> @builtin(position) vec4<f32> {
+  let corners = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+  return vec4<f32>(corners[index], 0.0, 1.0);
 }
 
 @fragment
-fn fsCompose(@builtin(position) fragPos: vec4<f32>) -> @location(0) vec4<f32> {
+fn fsCompose(@builtin(position) fragPos : vec4<f32>) -> @location(0) vec4<f32> {
   let coords = vec2<i32>(i32(fragPos.x), i32(fragPos.y));
-  let accum    = textureLoad(accumTex, coords, 0);
-  let logT     = textureLoad(logTTex,  coords, 0).r;
-  let w_fg     = accum.a;
-  let C_fg     = select(vec3<f32>(0.0), accum.rgb / w_fg, w_fg > 0.0001);
-  // T = prod(1-alpha_i); cleared to 0 → exp(0)=1 (fully transparent) before splats
-  let T        = exp(logT);
-  let coverage = 1.0 - T;
-  let color    = mix(bgColor.rgb, C_fg, coverage);
-  return vec4<f32>(color, 1.0);
+  let accum = textureLoad(accumTex, coords, 0);
+  let logT = textureLoad(logTTex, coords, 0).r;
+  let wFg = accum.a;
+  let colorFg = select(vec3<f32>(0.0), accum.rgb / wFg, wFg > 0.0001);
+  return vec4<f32>(mix(bgColor.rgb, colorFg, 1.0 - exp(logT)), 1.0);
 }
 `;
 
+function createStorageBuffer(device, data, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST) {
+  const buffer = device.createBuffer({
+    size: Math.max(4, data.byteLength),
+    usage,
+    mappedAtCreation: true,
+  });
+  new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  buffer.unmap();
+  return buffer;
+}
+
 export class WebGPUSplatRenderer {
   static async create(canvas, scene) {
-    if (!navigator.gpu) return null;
+    if (!navigator.gpu || !scene.opacityPhi) return null;
     try {
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) return null;
@@ -237,12 +348,9 @@ export class WebGPUSplatRenderer {
       const device = await adapter.requestDevice({
         requiredFeatures: supportsFloat32Blend ? ["float32-blendable"] : [],
       });
-      const format  = navigator.gpu.getPreferredCanvasFormat();
-      // Delay canvas context acquisition until AFTER initialize() succeeds,
-      // so a failed init doesn't prevent WebGL2 from claiming the canvas.
+      const format = navigator.gpu.getPreferredCanvasFormat();
       const renderer = new WebGPUSplatRenderer(canvas, scene, device, format, supportsFloat32Blend);
       await renderer.initialize();
-      // All init succeeded — now claim the canvas context
       const context = canvas.getContext("webgpu");
       if (!context) return null;
       context.configure({ device, format, alphaMode: "opaque" });
@@ -255,95 +363,87 @@ export class WebGPUSplatRenderer {
   }
 
   constructor(canvas, scene, device, format, supportsFloat32Blend) {
-    this.canvas  = canvas;
-    this.scene   = scene;
-    this.device  = device;
-    this.context = null;  // set by create() after initialize() succeeds
-    this.format  = format;
+    if (scene.shDegree !== 1 || scene.shFloats !== SH_FLOATS) {
+      throw new Error("Corrected WebGPU renderer currently expects SH1 exports");
+    }
+    this.canvas = canvas;
+    this.scene = scene;
+    this.device = device;
+    this.format = format;
+    this.context = null;
     this.accumFormat = supportsFloat32Blend ? "rgba32float" : "rgba16float";
     this.logTFormat = supportsFloat32Blend ? "rgba32float" : "rgba16float";
-    this.instanceCount = 0;
     this.renderOptions = { alphaScale: scene.render.alphaScale };
-    this._accumWidth  = 0;
+    this.instanceCount = 0;
+    this._accumWidth = 0;
     this._accumHeight = 0;
+    this.netLayout = splitOpacityPhiWeights(scene.opacityPhiWeights, scene.opacityPhi);
   }
 
   async initialize() {
     const device = this.device;
-    // Note: canvas context is acquired AFTER initialize() by create() to avoid
-    // preventing WebGL2 fallback if something here fails.
-
-    // ── Splat program ────────────────────────────────────────────────────
-    const splatShader = device.createShaderModule({ code: WGSL_SPLAT });
-
     this.uniformBuffer = device.createBuffer({
       size: UNIFORM_BUFFER_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    // SH stored as rgba16float texture (v5 format)
-    this.shTexture = null;  // created in initSHData()
-    this.instanceBuffer = device.createBuffer({
-      size: GEOM_FLOATS * 4,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-
-    this.splatBGL = device.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        { binding: 1, visibility: GPUShaderStage.VERTEX, texture: { sampleType: "float" } },
-      ],
-    });
-
-    const addBlend = {
-      color: { srcFactor: "one", dstFactor: "one", operation: "add" },
-      alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
-    };
-    const splatVtx = {
-      buffers: [{
-        arrayStride: 44, stepMode: "instance",
-        attributes: [
-          { shaderLocation: 0, offset:  0, format: "float32x4" },
-          { shaderLocation: 1, offset: 16, format: "float32x4" },
-          { shaderLocation: 2, offset: 32, format: "float32x3" },
-        ],
-      }],
-    };
-    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.splatBGL] });
-
-    // Pass 1a: accumulate (color*alpha_w, alpha_w) — single target
-    this.splatPipeline = device.createRenderPipeline({
-      layout: pipelineLayout,
-      vertex: { module: splatShader, entryPoint: "vsMain", ...splatVtx },
-      fragment: {
-        module: splatShader, entryPoint: "fsAccum",
-        targets: [{ format: this.accumFormat, blend: addBlend }],
-      },
-      primitive: { topology: "triangle-list", cullMode: "none" },
-    });
-
-    // Pass 1b: accumulate log(1-alpha) — single target, separate pass (no MRT)
-    this.logTPipeline = device.createRenderPipeline({
-      layout: pipelineLayout,
-      vertex: { module: splatShader, entryPoint: "vsMain", ...splatVtx },
-      fragment: {
-        module: splatShader, entryPoint: "fsLogT",
-        targets: [{ format: this.logTFormat, blend: addBlend }],
-      },
-      primitive: { topology: "triangle-list", cullMode: "none" },
-    });
-
-    // ── Compose program ─────────────────────────────────────────────────
-    const composeShader = device.createShaderModule({ code: WGSL_COMPOSE });
-
-    const bg = this.scene.render.backgroundTop;
     this.bgBuffer = device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    device.queue.writeBuffer(this.bgBuffer, 0,
-      new Float32Array([bg[0], bg[1], bg[2], bg[3]]));
+    device.queue.writeBuffer(this.bgBuffer, 0, new Float32Array(this.scene.render.backgroundTop));
 
-    this.composeBGL = device.createBindGroupLayout({
+    this.netOutBuffer = device.createBuffer({
+      size: 8,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.instanceBuffer = device.createBuffer({
+      size: GEOM_FLOATS * 4,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    this.w0Buffer = createStorageBuffer(device, this.netLayout.w0);
+    this.b0Buffer = createStorageBuffer(device, this.netLayout.b0);
+    this.w1Buffer = createStorageBuffer(device, this.netLayout.w1);
+    this.b1Buffer = createStorageBuffer(device, this.netLayout.b1);
+    this.w2Buffer = createStorageBuffer(device, this.netLayout.w2);
+    this.b2Buffer = createStorageBuffer(device, this.netLayout.b2);
+    this.wPhiBuffer = createStorageBuffer(device, this.netLayout.wPhi);
+    this.bPhiBuffer = createStorageBuffer(device, this.netLayout.bPhi);
+    this.wOpacityBuffer = createStorageBuffer(device, this.netLayout.wOpacity);
+    this.bOpacityBuffer = createStorageBuffer(device, this.netLayout.bOpacity);
+
+    const netShader = device.createShaderModule({ code: WGSL_NET });
+    const splatShader = device.createShaderModule({ code: WGSL_SPLAT });
+    const composeShader = device.createShaderModule({ code: WGSL_COMPOSE });
+
+    this.netBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "float" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      ],
+    });
+
+    this.splatBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX, texture: { sampleType: "float" } },
+        { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      ],
+    });
+
+    this.composeBindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
@@ -351,37 +451,74 @@ export class WebGPUSplatRenderer {
       ],
     });
 
-    this.composePipeline = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [this.composeBGL] }),
-      vertex:   { module: composeShader, entryPoint: "vsCompose" },
+    this.netPipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.netBindGroupLayout] }),
+      compute: { module: netShader, entryPoint: "main" },
+    });
+
+    const vertexState = {
+      module: splatShader,
+      entryPoint: "vsMain",
+      buffers: [{
+        arrayStride: GEOM_FLOATS * 4,
+        stepMode: "instance",
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: "float32x4" },
+          { shaderLocation: 1, offset: 16, format: "float32x4" },
+          { shaderLocation: 2, offset: 32, format: "float32x3" },
+        ],
+      }],
+    };
+    const additiveBlend = {
+      color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+      alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+    };
+
+    this.accumPipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.splatBindGroupLayout] }),
+      vertex: vertexState,
       fragment: {
-        module: composeShader, entryPoint: "fsCompose",
+        module: splatShader,
+        entryPoint: "fsAccum",
+        targets: [{ format: this.accumFormat, blend: additiveBlend }],
+      },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+    });
+
+    this.logTPipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.splatBindGroupLayout] }),
+      vertex: vertexState,
+      fragment: {
+        module: splatShader,
+        entryPoint: "fsLogT",
+        targets: [{ format: this.logTFormat, blend: additiveBlend }],
+      },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+    });
+
+    this.composePipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.composeBindGroupLayout] }),
+      vertex: { module: composeShader, entryPoint: "vsCompose" },
+      fragment: {
+        module: composeShader,
+        entryPoint: "fsCompose",
         targets: [{ format: this.format }],
       },
       primitive: { topology: "triangle-list" },
     });
-
-    this._rebuildSplatBindGroup();
-    // accumulation textures created on first resize()
   }
 
-  _rebuildSplatBindGroup() {
-    if (!this.shTexture) return;  // defer until initSHData() provides the texture
-    this.splatBindGroup = this.device.createBindGroup({
-      layout: this.splatBGL,
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: this.shTexture.createView() },
-      ],
-    });
+  get label() {
+    return "webgpu";
   }
 
-  _ensureAccumTexture(width, height) {
+  _ensureAccumTextures(width, height) {
     if (width === this._accumWidth && height === this._accumHeight) return;
-    this._accumWidth  = width;
+    this._accumWidth = width;
     this._accumHeight = height;
-    if (this.accumTexture) this.accumTexture.destroy();
-    if (this.logTTexture)  this.logTTexture.destroy();
+
+    this.accumTexture?.destroy();
+    this.logTTexture?.destroy();
     this.accumTexture = this.device.createTexture({
       size: [width, height],
       format: this.accumFormat,
@@ -393,9 +530,9 @@ export class WebGPUSplatRenderer {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.accumView = this.accumTexture.createView();
-    this.logTView  = this.logTTexture.createView();
+    this.logTView = this.logTTexture.createView();
     this.composeBindGroup = this.device.createBindGroup({
-      layout: this.composeBGL,
+      layout: this.composeBindGroupLayout,
       entries: [
         { binding: 0, resource: this.accumView },
         { binding: 1, resource: { buffer: this.bgBuffer } },
@@ -404,79 +541,117 @@ export class WebGPUSplatRenderer {
     });
   }
 
-  get label() { return "webgpu"; }
+  _rebuildBindGroups() {
+    if (!this.shTexture) return;
+    this.netBindGroup = this.device.createBindGroup({
+      layout: this.netBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: this.shTexture.createView() },
+        { binding: 2, resource: { buffer: this.instanceBuffer } },
+        { binding: 3, resource: { buffer: this.netOutBuffer } },
+        { binding: 4, resource: { buffer: this.w0Buffer } },
+        { binding: 5, resource: { buffer: this.b0Buffer } },
+        { binding: 6, resource: { buffer: this.w1Buffer } },
+        { binding: 7, resource: { buffer: this.b1Buffer } },
+        { binding: 8, resource: { buffer: this.w2Buffer } },
+        { binding: 9, resource: { buffer: this.b2Buffer } },
+        { binding: 10, resource: { buffer: this.wPhiBuffer } },
+        { binding: 11, resource: { buffer: this.bPhiBuffer } },
+        { binding: 12, resource: { buffer: this.wOpacityBuffer } },
+        { binding: 13, resource: { buffer: this.bOpacityBuffer } },
+      ],
+    });
+
+    this.splatBindGroup = this.device.createBindGroup({
+      layout: this.splatBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: this.shTexture.createView() },
+        { binding: 2, resource: { buffer: this.netOutBuffer } },
+      ],
+    });
+  }
 
   resize(width, height) {
-    this.canvas.width  = width;
+    this.canvas.width = width;
     this.canvas.height = height;
-    this._ensureAccumTexture(width, height);
+    this._ensureAccumTextures(width, height);
   }
 
   initSHData(shData) {
-    // shData: Uint16Array of raw float16 bits, N*48 elements (v5 format)
-    const device = this.device;
-    const N = shData.length / 48;
-    const SH_TEX_WIDTH = 2048;
-    const totalTexels  = N * 12;
-    const height = Math.ceil(totalTexels / SH_TEX_WIDTH);
-
-    if (this.shTexture) this.shTexture.destroy();
-    this.shTexture = device.createTexture({
+    const texels = (shData.length / SH_FLOATS) * 3;
+    const height = Math.ceil(texels / SH_TEX_WIDTH);
+    const padded = new Uint16Array(SH_TEX_WIDTH * height * 4);
+    padded.set(shData);
+    this.shTexture?.destroy();
+    this.shTexture = this.device.createTexture({
       size: [SH_TEX_WIDTH, height],
       format: "rgba16float",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-
-    // Pad data to full rows
-    const padded = new Uint16Array(SH_TEX_WIDTH * height * 4);
-    padded.set(shData);
-
-    device.queue.writeTexture(
+    this.device.queue.writeTexture(
       { texture: this.shTexture },
       padded.buffer,
       { offset: 0, bytesPerRow: SH_TEX_WIDTH * 8, rowsPerImage: height },
       { width: SH_TEX_WIDTH, height },
     );
-    this._rebuildSplatBindGroup();
+    this._rebuildBindGroups();
   }
 
   updateGeometryData(geomData) {
-    const device = this.device;
-    if (!this.instanceBuffer || this.instanceBuffer.size !== geomData.byteLength) {
-      if (this.instanceBuffer) this.instanceBuffer.destroy();
-      this.instanceBuffer = device.createBuffer({
+    if (this.instanceBuffer.size !== geomData.byteLength) {
+      this.instanceBuffer.destroy();
+      this.instanceBuffer = this.device.createBuffer({
         size: geomData.byteLength,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
     }
-    device.queue.writeBuffer(this.instanceBuffer, 0, geomData.buffer, geomData.byteOffset, geomData.byteLength);
+    this.device.queue.writeBuffer(this.instanceBuffer, 0, geomData.buffer, geomData.byteOffset, geomData.byteLength);
     this.instanceCount = geomData.length / GEOM_FLOATS;
+
+    const netBytes = this.instanceCount * 8;
+    if (this.netOutBuffer.size !== netBytes) {
+      this.netOutBuffer.destroy();
+      this.netOutBuffer = this.device.createBuffer({
+        size: netBytes,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+    }
+    this._rebuildBindGroups();
   }
 
-  updateSceneData(geomData) { return this.updateGeometryData(geomData); }
+  updateSceneData(geomData) {
+    return this.updateGeometryData(geomData);
+  }
 
-  setRenderOptions(options) { this.renderOptions = options; }
+  setRenderOptions(options) {
+    this.renderOptions = options;
+  }
 
   render(cameraState) {
-    if (!this.splatBindGroup) return;  // wait for initSHData()
-    const device = this.device;
-    const W = this.canvas.width;
-    const H = this.canvas.height;
-    this._ensureAccumTexture(W, H);
+    if (!this.netBindGroup || !this.splatBindGroup || !this.context) return;
 
-    // Pack uniforms
     const packed = new Float32Array(44);
     packed.set(cameraState.viewProjection, 0);
     packed.set(cameraState.view, 16);
-    packed[32] = W; packed[33] = H; packed[34] = cameraState.focal; packed[35] = 0;
+    packed[32] = this.canvas.width;
+    packed[33] = this.canvas.height;
+    packed[34] = cameraState.focal;
     packed[36] = this.renderOptions.alphaScale;
-    packed[40] = cameraState.eye[0]; packed[41] = cameraState.eye[1];
-    packed[42] = cameraState.eye[2]; packed[43] = 0;
-    device.queue.writeBuffer(this.uniformBuffer, 0, packed.buffer);
+    packed[40] = cameraState.eye[0];
+    packed[41] = cameraState.eye[1];
+    packed[42] = cameraState.eye[2];
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, packed);
 
-    const encoder = device.createCommandEncoder();
+    const encoder = this.device.createCommandEncoder();
 
-    // ── Pass 1a: accumulate (color*alpha_w, alpha_w) into accumTexture ───
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(this.netPipeline);
+    computePass.setBindGroup(0, this.netBindGroup);
+    computePass.dispatchWorkgroups(Math.ceil(this.instanceCount / WORKGROUP_SIZE));
+    computePass.end();
+
     const accumPass = encoder.beginRenderPass({
       colorAttachments: [{
         view: this.accumView,
@@ -485,13 +660,12 @@ export class WebGPUSplatRenderer {
         storeOp: "store",
       }],
     });
-    accumPass.setPipeline(this.splatPipeline);
+    accumPass.setPipeline(this.accumPipeline);
     accumPass.setBindGroup(0, this.splatBindGroup);
     accumPass.setVertexBuffer(0, this.instanceBuffer);
     accumPass.draw(6, this.instanceCount);
     accumPass.end();
 
-    // ── Pass 1b: accumulate log(1-alpha) into logTTexture ────────────────
     const logTPass = encoder.beginRenderPass({
       colorAttachments: [{
         view: this.logTView,
@@ -506,13 +680,12 @@ export class WebGPUSplatRenderer {
     logTPass.draw(6, this.instanceCount);
     logTPass.end();
 
-    // ── Pass 2: compose to canvas ────────────────────────────────────────
     const composePass = encoder.beginRenderPass({
       colorAttachments: [{
         view: this.context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
         loadOp: "clear",
         storeOp: "store",
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
       }],
     });
     composePass.setPipeline(this.composePipeline);
@@ -520,6 +693,6 @@ export class WebGPUSplatRenderer {
     composePass.draw(3);
     composePass.end();
 
-    device.queue.submit([encoder.finish()]);
+    this.device.queue.submit([encoder.finish()]);
   }
 }

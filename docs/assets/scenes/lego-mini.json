@@ -1,32 +1,34 @@
 {
-  "version": 5,
+  "version": 6,
   "slug": "lego-mini",
-  "title": "Mobile-GS Lego (_ms 60k fine-tune, SH3, 29.3 dB)",
+  "title": "Mobile-GS Lego (transition smoke, corrected path)",
   "binary": "lego-mini.bin",
-  "splatCount": 210707,
+  "splatCount": 194526,
+  "shDegree": 1,
+  "shCoefficientsPerChannel": 4,
   "bounds": {
     "min": [
-      -0.6456040143966675,
-      -1.196291208267212,
-      -0.4152553379535675
+      -0.6571191549301147,
+      -1.1948506832122803,
+      -0.414040207862854
     ],
     "max": [
-      0.6852449178695679,
-      1.1824893951416016,
-      1.0123834609985352
+      0.6832162141799927,
+      1.179477572441101,
+      1.016113519668579
     ],
     "center": [
-      0.019820451736450195,
-      -0.006900906562805176,
-      0.298564076423645
+      0.013048529624938965,
+      -0.0076865553855896,
+      0.30103665590286255
     ],
-    "radius": 1.5384984016418457
+    "radius": 1.5394214391708374
   },
   "camera": {
-    "yaw": 0.9,
-    "pitch": 0.45,
-    "distance": 4.000095844268799,
-    "fovY": 0.8028514559173916
+    "yaw": -0.0049086429129491455,
+    "pitch": 0.8014352471790552,
+    "distance": 3.8211545944213867,
+    "fovY": 0.6911112070083618
   },
   "render": {
     "alphaScale": 1.0,
@@ -43,5 +45,16 @@
       1.0,
       1.0
     ]
+  },
+  "opacityPhi": {
+    "binary": "lego-mini-opacity-phi.bin",
+    "inputDim": 22,
+    "hiddenDims": [
+      256,
+      128,
+      64
+    ],
+    "format": "linear_relu_relu_linear_heads_v1",
+    "shLayout": "coeff-major-rgb"
   }
 }

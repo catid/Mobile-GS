@@ -180,14 +180,30 @@ h1 {
 
 .reference-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
 }
 
 .reference-card {
   margin: 0;
   display: grid;
   gap: 6px;
+}
+
+.reference-trigger {
+  padding: 0;
+  border: 0;
+  border-radius: 16px;
+  background: transparent;
+  cursor: zoom-in;
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+
+.reference-trigger:hover,
+.reference-trigger:focus-visible {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 30px rgba(0, 0, 0, 0.22);
+  outline: none;
 }
 
 .reference-card img {
@@ -204,6 +220,73 @@ h1 {
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.08em;
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.lightbox[hidden] {
+  display: none;
+}
+
+.lightbox-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(3, 7, 13, 0.86);
+  backdrop-filter: blur(18px);
+}
+
+.lightbox-dialog {
+  position: relative;
+  z-index: 1;
+  width: min(94vw, 1400px);
+  max-height: calc(100vh - 48px);
+  display: grid;
+  gap: 12px;
+  padding: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 28px;
+  background: rgba(8, 13, 24, 0.92);
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.42);
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 42px;
+  height: 42px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+  font: inherit;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.lightbox-title {
+  margin: 0;
+  padding-right: 56px;
+  font-size: 0.82rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+}
+
+.lightbox-image {
+  width: 100%;
+  max-height: calc(100vh - 160px);
+  display: block;
+  object-fit: contain;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.98);
 }
 
 .viewport {
@@ -263,7 +346,26 @@ h1 {
     max-height: none;
   }
 
+  .lightbox {
+    padding: 12px;
+  }
+
+  .lightbox-dialog {
+    width: 100%;
+    max-height: calc(100vh - 24px);
+    padding: 18px;
+    border-radius: 22px;
+  }
+
+  .lightbox-image {
+    max-height: calc(100vh - 132px);
+  }
+
   .viewport {
     min-height: 60vh;
+  }
+
+  .reference-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

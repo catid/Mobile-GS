@@ -9,6 +9,7 @@ import sys
 
 import numpy as np
 from plyfile import PlyData
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -25,6 +26,25 @@ def load_cameras(camera_path: Path) -> list[dict]:
     if not camera_path.exists():
         return []
     return json.loads(camera_path.read_text())
+
+
+def load_opacity_phi_state(path: Path) -> dict[str, np.ndarray] | None:
+    if not path.exists():
+        return None
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    ordered_keys = [
+        "main.0.weight",
+        "main.0.bias",
+        "main.2.weight",
+        "main.2.bias",
+        "main.4.weight",
+        "main.4.bias",
+        "phi_output.0.weight",
+        "phi_output.0.bias",
+        "opacity_output.0.weight",
+        "opacity_output.0.bias",
+    ]
+    return {key: state[key].detach().cpu().numpy().astype(np.float32) for key in ordered_keys}
 
 
 def compute_camera_defaults(cameras: list[dict], target: np.ndarray, scene_radius: float) -> dict:
@@ -64,6 +84,8 @@ def main() -> None:
                         help="Maximum splats to export (0 = keep all)")
     parser.add_argument("--white_background", action="store_true",
                         help="Use white background (for models trained with white_background=True)")
+    parser.add_argument("--opacity-phi", type=Path,
+                        help="Optional path to opacity_phi_nn.pt. Defaults to a sibling of the PLY.")
     args = parser.parse_args()
 
     ply = PlyData.read(args.ply)["vertex"]
@@ -85,21 +107,30 @@ def main() -> None:
         axis=1,
     )
 
-    # Load SH rest coefficients if available (45 = 15 per channel × 3 channels for SH3)
     rest_props = [p.name for p in ply.properties if p.name.startswith("f_rest_")]
     n_rest = len(rest_props)
-    if n_rest >= 45:
-        rest = np.stack(
-            [np.asarray(ply[f"f_rest_{i}"], dtype=np.float32) for i in range(45)],
-            axis=1,
-        )  # N, 45: R_1..R_15, G_1..G_15, B_1..B_15
-    else:
-        rest = np.zeros((len(sh_dc), 45), dtype=np.float32)
+    if n_rest % 3 != 0:
+        raise ValueError(f"Unexpected SH layout: found {n_rest} rest coefficients")
+    coeffs_per_channel = 1 + (n_rest // 3)
+    sh_degree = int(round(math.sqrt(coeffs_per_channel) - 1))
+    if (sh_degree + 1) ** 2 != coeffs_per_channel:
+        raise ValueError(f"Cannot infer SH degree from {coeffs_per_channel} coefficients per channel")
 
-    # SH per channel: [dc, rest_0..14] = 16 coefficients
-    sh_r = np.concatenate([sh_dc[:, 0:1], rest[:, 0:15]], axis=1)   # N, 16
-    sh_g = np.concatenate([sh_dc[:, 1:2], rest[:, 15:30]], axis=1)  # N, 16
-    sh_b = np.concatenate([sh_dc[:, 2:3], rest[:, 30:45]], axis=1)  # N, 16
+    if n_rest > 0:
+        rest = np.stack(
+            [np.asarray(ply[f"f_rest_{i}"], dtype=np.float32) for i in range(n_rest)],
+            axis=1,
+        ).reshape(len(sh_dc), 3, coeffs_per_channel - 1)
+    else:
+        rest = np.zeros((len(sh_dc), 3, 0), dtype=np.float32)
+
+    sh_coeffs = np.zeros((len(sh_dc), coeffs_per_channel, 3), dtype=np.float32)
+    sh_coeffs[:, 0, :] = sh_dc
+    if coeffs_per_channel > 1:
+        sh_coeffs[:, 1:, 0] = rest[:, 0, :]
+        sh_coeffs[:, 1:, 1] = rest[:, 1, :]
+        sh_coeffs[:, 1:, 2] = rest[:, 2, :]
+    sh_flat = sh_coeffs.reshape(len(sh_dc), coeffs_per_channel * 3)
 
     opacity = sigmoid(np.asarray(ply["opacity"], dtype=np.float32))
 
@@ -124,9 +155,7 @@ def main() -> None:
         keep = np.argpartition(importance, -args.max_splats)[-args.max_splats:]
         keep = keep[np.argsort(importance[keep])[::-1]]
         xyz     = xyz[keep]
-        sh_r    = sh_r[keep]
-        sh_g    = sh_g[keep]
-        sh_b    = sh_b[keep]
+        sh_flat = sh_flat[keep]
         opacity = opacity[keep]
         quat    = quat[keep]
         scale   = scale[keep]
@@ -142,37 +171,66 @@ def main() -> None:
     binary_name  = f"{args.slug}.bin"
     manifest_name = f"{args.slug}.json"
 
-    # Binary format v5: two sections — geometry as float32, SH as float16
-    # Section 1: geometry (11 floats per splat, float32)
-    #   [0-2]  xyz position
-    #   [3]    opacity (sigmoid-activated)
-    #   [4-7]  quaternion (qw, qx, qy, qz) normalised
-    #   [8-10] scale (exp-activated sx, sy, sz)
-    #   (origIndex removed — renderer uses instance ID instead)
-    # Section 2: SH (48 float16 per splat): sh_r[0..15], sh_g[0..15], sh_b[0..15]
-    #   Float16 SH: max quantization error ~0.007, below 1-bit display precision
+    opacity_phi_path = args.opacity_phi or args.ply.with_name("opacity_phi_nn.pt")
+    opacity_phi = load_opacity_phi_state(opacity_phi_path)
+    if opacity_phi is not None and sh_degree != 1:
+        raise ValueError(
+            f"Opacity/phi export currently expects SH1 assets, but {args.ply} has SH degree {sh_degree}"
+        )
+
     geom = np.zeros((n, 11), dtype=np.float32)
     geom[:, 0:3]  = xyz
     geom[:, 3]    = opacity
     geom[:, 4:8]  = quat
     geom[:, 8:11] = scale
 
-    # Section 2: SH (48 float16 per splat): sh_r[0..15], sh_g[0..15], sh_b[0..15]
-    sh = np.concatenate([sh_r, sh_g, sh_b], axis=1).astype(np.float16)
+    if opacity_phi is None:
+        binary_version = 5
+        sh = np.concatenate(
+            [
+                sh_coeffs[:, :, 0],
+                sh_coeffs[:, :, 1],
+                sh_coeffs[:, :, 2],
+            ],
+            axis=1,
+        ).astype(np.float16)
+    else:
+        binary_version = 6
+        sh = sh_flat.astype(np.float16)
 
     with open(output_dir / binary_name, "wb") as f:
         geom.tofile(f)
         sh.tofile(f)
 
+    opacity_phi_name = None
+    if opacity_phi is not None:
+        opacity_phi_name = f"{args.slug}-opacity-phi.bin"
+        with open(output_dir / opacity_phi_name, "wb") as f:
+            for key in [
+                "main.0.weight",
+                "main.0.bias",
+                "main.2.weight",
+                "main.2.bias",
+                "main.4.weight",
+                "main.4.bias",
+                "phi_output.0.weight",
+                "phi_output.0.bias",
+                "opacity_output.0.weight",
+                "opacity_output.0.bias",
+            ]:
+                opacity_phi[key].astype(np.float32).tofile(f)
+
     cameras = load_cameras(args.cameras) if args.cameras else []
     camera_defaults = compute_camera_defaults(cameras, center, scene_radius)
 
     manifest = {
-        "version": 5,
+        "version": binary_version,
         "slug": args.slug,
         "title": args.title,
         "binary": binary_name,
         "splatCount": n,
+        "shDegree": sh_degree,
+        "shCoefficientsPerChannel": coeffs_per_channel,
         "bounds": {
             "min": bbox_min.tolist(),
             "max": bbox_max.tolist(),
@@ -187,6 +245,18 @@ def main() -> None:
             "backgroundBottom": [1.0, 1.0, 1.0, 1.0] if args.white_background else [0.0, 0.0, 0.0, 1.0],
         },
     }
+    if opacity_phi_name is not None:
+        manifest["opacityPhi"] = {
+            "binary": opacity_phi_name,
+            "inputDim": int(opacity_phi["main.0.weight"].shape[1]),
+            "hiddenDims": [
+                int(opacity_phi["main.0.weight"].shape[0]),
+                int(opacity_phi["main.2.weight"].shape[0]),
+                int(opacity_phi["main.4.weight"].shape[0]),
+            ],
+            "format": "linear_relu_relu_linear_heads_v1",
+            "shLayout": "coeff-major-rgb",
+        }
     (output_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
 
     binary_mb = (output_dir / binary_name).stat().st_size / (1024 * 1024)
