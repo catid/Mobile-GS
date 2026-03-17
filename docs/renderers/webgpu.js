@@ -289,8 +289,8 @@ fn splatAlpha(in : VertexOutput, fragCoord : vec2<f32>) -> f32 {
 }
 
 @fragment
-fn fsAccum(in : VertexOutput, @builtin(position) fragPos : vec4<f32>) -> @location(0) vec4<f32> {
-  let fragCoord = vec2<f32>(fragPos.x, camera.viewport.y - fragPos.y);
+fn fsAccum(in : VertexOutput) -> @location(0) vec4<f32> {
+  let fragCoord = vec2<f32>(in.position.x, camera.viewport.y - in.position.y);
   let alpha = splatAlpha(in, fragCoord);
   let alphaWeight = alpha * in.weight;
   if (alphaWeight < 0.00001) {
@@ -300,8 +300,8 @@ fn fsAccum(in : VertexOutput, @builtin(position) fragPos : vec4<f32>) -> @locati
 }
 
 @fragment
-fn fsLogT(in : VertexOutput, @builtin(position) fragPos : vec4<f32>) -> @location(0) vec4<f32> {
-  let fragCoord = vec2<f32>(fragPos.x, camera.viewport.y - fragPos.y);
+fn fsLogT(in : VertexOutput) -> @location(0) vec4<f32> {
+  let fragCoord = vec2<f32>(in.position.x, camera.viewport.y - in.position.y);
   let alpha = splatAlpha(in, fragCoord);
   if (alpha < 0.00001) {
     discard;
