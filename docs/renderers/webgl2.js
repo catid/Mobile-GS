@@ -256,6 +256,7 @@ export class WebGL2SplatRenderer {
     this._instanceBufferSize = 0;
     this._fboWidth  = 0;
     this._fboHeight = 0;
+    this._diagDone   = false;  // run diagnostic readback once
 
     // Determine best float format for the accumulation FBO
     const hasFloat = !!gl.getExtension("EXT_color_buffer_float");
@@ -467,6 +468,31 @@ export class WebGL2SplatRenderer {
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
 
     gl.bindVertexArray(null);
+
+    // ── Diagnostic: read one pixel from logT and accum (first frame only) ─
+    if (!this._diagDone && this.instanceCount > 0) {
+      this._diagDone = true;
+      const cx = W >> 1, cy = H >> 1;
+      const fmtRead = gl.RGBA, typeRead = gl.FLOAT;
+      const buf4 = new Float32Array(4);
+      // Read from logT FBO
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.logTFBO);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      gl.readPixels(cx, cy, 1, 1, fmtRead, typeRead, buf4);
+      const logTVal = buf4[0];
+      console.log(`[WebGL2 diag] center pixel logT.r=${logTVal.toFixed(4)}, T=${Math.exp(logTVal).toFixed(4)}, coverage=${(1-Math.exp(logTVal)).toFixed(4)}`);
+      // Read from accum FBO
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.accumFBO);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      gl.readPixels(cx, cy, 1, 1, fmtRead, typeRead, buf4);
+      console.log(`[WebGL2 diag] center pixel accum=(${buf4[0].toFixed(3)},${buf4[1].toFixed(3)},${buf4[2].toFixed(3)},${buf4[3].toFixed(3)})`);
+      const glErr = gl.getError();
+      if (glErr) console.error(`[WebGL2 diag] gl.getError()=${glErr}`);
+      // Check FBO status
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.logTFBO);
+      const fboSt = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      console.log(`[WebGL2 diag] logTFBO status=${fboSt} (${fboSt===gl.FRAMEBUFFER_COMPLETE?'COMPLETE':'INCOMPLETE'})`);
+    }
 
     // ── Pass 2: compose with background ──────────────────────────────────
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
