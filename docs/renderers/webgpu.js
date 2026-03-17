@@ -176,12 +176,12 @@ struct VertexOutput {
 
 struct SplatOutputs {
   @location(0) accum : vec4<f32>,
-  @location(1) logT : vec4<f32>,
+  @location(1) logT : f32,
 };
 
-const quad = array<vec2<f32>, 6>(
-  vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
-  vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+const quad = array<vec2<f32>, 4>(
+  vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0),
+  vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, 1.0),
 );
 
 fn quatToMat(q : vec4<f32>) -> mat3x3<f32> {
@@ -315,7 +315,7 @@ fn fsSplat(in : VertexOutput) -> SplatOutputs {
   } else {
     out.accum = vec4<f32>(0.0);
   }
-  out.logT = vec4<f32>(log(1.0 - alpha), 0.0, 0.0, 0.0);
+  out.logT = log(1.0 - alpha);
   return out;
 }
 `;
@@ -402,7 +402,7 @@ export class WebGPUSplatRenderer {
     this.format = format;
     this.context = null;
     this.accumFormat = supportsFloat32Blend ? "rgba32float" : "rgba16float";
-    this.logTFormat = supportsFloat32Blend ? "rgba32float" : "rgba16float";
+    this.logTFormat = "r16float";
     this.renderOptions = { alphaScale: scene.render.alphaScale };
     this.uniformData = new Float32Array(44);
     this.instanceCount = 0;
@@ -489,7 +489,7 @@ export class WebGPUSplatRenderer {
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     });
 
@@ -527,7 +527,7 @@ export class WebGPUSplatRenderer {
           { format: this.logTFormat, blend: additiveBlend },
         ],
       },
-      primitive: { topology: "triangle-list", cullMode: "none" },
+      primitive: { topology: "triangle-strip", cullMode: "none" },
     });
 
     this.composePipeline = device.createRenderPipeline({
@@ -713,7 +713,7 @@ export class WebGPUSplatRenderer {
     splatPass.setPipeline(this.splatPipeline);
     splatPass.setBindGroup(0, this.splatBindGroup);
     splatPass.setVertexBuffer(0, this.instanceBuffer);
-    splatPass.draw(6, this.instanceCount);
+    splatPass.draw(4, this.instanceCount);
     splatPass.end();
 
     const composePass = encoder.beginRenderPass({
