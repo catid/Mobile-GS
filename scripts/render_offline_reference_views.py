@@ -52,8 +52,8 @@ def parse_args():
         type=Path,
         default=Path("docs/assets/offline-views"),
     )
-    parser.add_argument("--width", type=int, default=320)
-    parser.add_argument("--height", type=int, default=320)
+    parser.add_argument("--width", type=int, default=800)
+    parser.add_argument("--height", type=int, default=800)
     parser.add_argument("--distance-scale", type=float, default=1.0)
     parser.add_argument("--sh-degree", type=int, default=3)
     parser.add_argument("--opacity-phi", type=Path)

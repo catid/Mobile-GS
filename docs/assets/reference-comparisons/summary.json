@@ -1,0 +1,53 @@
+{
+  "method": "ours_55000",
+  "overallMetrics": {
+    "PSNR": 33.087642669677734,
+    "SSIM": 0.9733263254165649,
+    "LPIPS": 0.025436734780669212
+  },
+  "representativeMeanPSNR": 34.09924570719401,
+  "items": [
+    {
+      "index": 0,
+      "imageName": "r_0",
+      "file": "r_0.png",
+      "psnr": 32.48485565185547,
+      "renderFile": "00000.png"
+    },
+    {
+      "index": 33,
+      "imageName": "r_33",
+      "file": "r_33.png",
+      "psnr": 32.21415710449219,
+      "renderFile": "00033.png"
+    },
+    {
+      "index": 66,
+      "imageName": "r_66",
+      "file": "r_66.png",
+      "psnr": 35.779701232910156,
+      "renderFile": "00066.png"
+    },
+    {
+      "index": 99,
+      "imageName": "r_99",
+      "file": "r_99.png",
+      "psnr": 32.943519592285156,
+      "renderFile": "00099.png"
+    },
+    {
+      "index": 132,
+      "imageName": "r_132",
+      "file": "r_132.png",
+      "psnr": 35.02423095703125,
+      "renderFile": "00132.png"
+    },
+    {
+      "index": 165,
+      "imageName": "r_165",
+      "file": "r_165.png",
+      "psnr": 36.149009704589844,
+      "renderFile": "00165.png"
+    }
+  ]
+}

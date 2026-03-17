@@ -142,7 +142,7 @@ h1 {
 
 .reference-gallery {
   display: grid;
-  gap: 12px;
+  gap: 18px;
   padding: 14px;
   border-radius: 22px;
   background: rgba(255, 255, 255, 0.05);
@@ -152,6 +152,17 @@ h1 {
 .reference-copy {
   display: grid;
   gap: 6px;
+}
+
+.model-summary {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+  font-size: 0.88rem;
+}
+
+.model-summary strong {
+  color: var(--text);
 }
 
 .reference-kicker,
@@ -178,10 +189,37 @@ h1 {
   font-size: 0.84rem;
 }
 
+.reference-group {
+  display: grid;
+  gap: 10px;
+}
+
+.reference-group-title,
+.reference-group-note {
+  margin: 0;
+}
+
+.reference-group-title {
+  font-size: 0.8rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+}
+
+.reference-group-note {
+  color: var(--muted);
+  line-height: 1.4;
+  font-size: 0.82rem;
+}
+
 .reference-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.reference-grid--comparisons {
+  grid-template-columns: 1fr;
 }
 
 .reference-card {
@@ -220,6 +258,16 @@ h1 {
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.08em;
+}
+
+.reference-card.is-comparison img {
+  aspect-ratio: 2 / 1;
+  object-fit: cover;
+}
+
+.reference-card.is-comparison figcaption {
+  text-transform: none;
+  letter-spacing: 0.03em;
 }
 
 .lightbox {
@@ -367,5 +415,9 @@ h1 {
 
   .reference-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .reference-grid--comparisons {
+    grid-template-columns: 1fr;
   }
 }

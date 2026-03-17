@@ -17,6 +17,10 @@
             Static GitHub Pages viewer for a real Mobile-GS scene. WebGPU is used when available,
             with an automatic GPU-backed fallback for browsers that do not expose it yet.
           </p>
+          <p class="model-summary">
+            Current checked-in export: corrected 55k Mobile-GS retrain, 197,151 splats, and
+            <strong>33.09 dB PSNR</strong> on the 200-view NeRF Synthetic Lego test split.
+          </p>
           <div class="meta">
             <span id="scene-title">Loading scene…</span>
             <span id="renderer-label">Renderer: probing</span>
@@ -46,13 +50,19 @@
           <section class="reference-gallery" aria-labelledby="offline-reference-title">
             <div class="reference-copy">
               <p class="reference-kicker">Offline CUDA Reference</p>
-              <h2 id="offline-reference-title">Six native render views</h2>
+              <h2 id="offline-reference-title">Native render views and test-set comparisons</h2>
               <p class="reference-note">
-                Offline renders from the bundled Mobile-GS model: front, back, left, right, top, and bottom.
+                The bundled export now shows both six canonical native offline views and six evenly spaced
+                test-camera comparisons with per-view PSNR.
               </p>
             </div>
-            <div class="reference-grid">
-              <figure class="reference-card">
+            <div class="reference-group">
+              <p class="reference-group-title">Canonical native renders</p>
+              <p class="reference-group-note">
+                Strict front, back, left, right, top, and bottom renders from the offline CUDA path at 800 × 800.
+              </p>
+              <div class="reference-grid reference-grid--square">
+                <figure class="reference-card">
                 <button
                   class="reference-trigger"
                   type="button"
@@ -64,8 +74,8 @@
                   <img src="./assets/offline-views/front.png" alt="Offline renderer front view" loading="lazy" />
                 </button>
                 <figcaption>Front</figcaption>
-              </figure>
-              <figure class="reference-card">
+                </figure>
+                <figure class="reference-card">
                 <button
                   class="reference-trigger"
                   type="button"
@@ -77,8 +87,8 @@
                   <img src="./assets/offline-views/back.png" alt="Offline renderer back view" loading="lazy" />
                 </button>
                 <figcaption>Back</figcaption>
-              </figure>
-              <figure class="reference-card">
+                </figure>
+                <figure class="reference-card">
                 <button
                   class="reference-trigger"
                   type="button"
@@ -90,8 +100,8 @@
                   <img src="./assets/offline-views/left.png" alt="Offline renderer left view" loading="lazy" />
                 </button>
                 <figcaption>Left</figcaption>
-              </figure>
-              <figure class="reference-card">
+                </figure>
+                <figure class="reference-card">
                 <button
                   class="reference-trigger"
                   type="button"
@@ -103,8 +113,8 @@
                   <img src="./assets/offline-views/right.png" alt="Offline renderer right view" loading="lazy" />
                 </button>
                 <figcaption>Right</figcaption>
-              </figure>
-              <figure class="reference-card">
+                </figure>
+                <figure class="reference-card">
                 <button
                   class="reference-trigger"
                   type="button"
@@ -116,8 +126,8 @@
                   <img src="./assets/offline-views/top.png" alt="Offline renderer top view" loading="lazy" />
                 </button>
                 <figcaption>Top</figcaption>
-              </figure>
-              <figure class="reference-card">
+                </figure>
+                <figure class="reference-card">
                 <button
                   class="reference-trigger"
                   type="button"
@@ -129,10 +139,98 @@
                   <img src="./assets/offline-views/bottom.png" alt="Offline renderer bottom view" loading="lazy" />
                 </button>
                 <figcaption>Bottom</figcaption>
-              </figure>
+                </figure>
+              </div>
+            </div>
+            <div class="reference-group">
+              <p class="reference-group-title">Ground truth vs. offline render</p>
+              <p class="reference-group-note">
+                Six evenly spaced test views from the native evaluation set. Left: original image. Right: offline Mobile-GS render.
+                Mean PSNR across these six comparisons: <strong>34.10 dB</strong>.
+              </p>
+              <div class="reference-grid reference-grid--comparisons">
+                <figure class="reference-card is-comparison">
+                  <button
+                    class="reference-trigger"
+                    type="button"
+                    data-lightbox-src="./assets/reference-comparisons/r_0.png"
+                    data-lightbox-alt="Ground truth and offline render comparison for test view r_0"
+                    data-lightbox-title="r_0 · PSNR 32.48 dB"
+                    aria-label="Open comparison for test view r_0"
+                  >
+                    <img src="./assets/reference-comparisons/r_0.png" alt="Ground truth and offline render comparison for test view r_0" loading="lazy" />
+                  </button>
+                  <figcaption>r_0 · 32.48 dB PSNR</figcaption>
+                </figure>
+                <figure class="reference-card is-comparison">
+                  <button
+                    class="reference-trigger"
+                    type="button"
+                    data-lightbox-src="./assets/reference-comparisons/r_33.png"
+                    data-lightbox-alt="Ground truth and offline render comparison for test view r_33"
+                    data-lightbox-title="r_33 · PSNR 32.21 dB"
+                    aria-label="Open comparison for test view r_33"
+                  >
+                    <img src="./assets/reference-comparisons/r_33.png" alt="Ground truth and offline render comparison for test view r_33" loading="lazy" />
+                  </button>
+                  <figcaption>r_33 · 32.21 dB PSNR</figcaption>
+                </figure>
+                <figure class="reference-card is-comparison">
+                  <button
+                    class="reference-trigger"
+                    type="button"
+                    data-lightbox-src="./assets/reference-comparisons/r_66.png"
+                    data-lightbox-alt="Ground truth and offline render comparison for test view r_66"
+                    data-lightbox-title="r_66 · PSNR 35.78 dB"
+                    aria-label="Open comparison for test view r_66"
+                  >
+                    <img src="./assets/reference-comparisons/r_66.png" alt="Ground truth and offline render comparison for test view r_66" loading="lazy" />
+                  </button>
+                  <figcaption>r_66 · 35.78 dB PSNR</figcaption>
+                </figure>
+                <figure class="reference-card is-comparison">
+                  <button
+                    class="reference-trigger"
+                    type="button"
+                    data-lightbox-src="./assets/reference-comparisons/r_99.png"
+                    data-lightbox-alt="Ground truth and offline render comparison for test view r_99"
+                    data-lightbox-title="r_99 · PSNR 32.94 dB"
+                    aria-label="Open comparison for test view r_99"
+                  >
+                    <img src="./assets/reference-comparisons/r_99.png" alt="Ground truth and offline render comparison for test view r_99" loading="lazy" />
+                  </button>
+                  <figcaption>r_99 · 32.94 dB PSNR</figcaption>
+                </figure>
+                <figure class="reference-card is-comparison">
+                  <button
+                    class="reference-trigger"
+                    type="button"
+                    data-lightbox-src="./assets/reference-comparisons/r_132.png"
+                    data-lightbox-alt="Ground truth and offline render comparison for test view r_132"
+                    data-lightbox-title="r_132 · PSNR 35.02 dB"
+                    aria-label="Open comparison for test view r_132"
+                  >
+                    <img src="./assets/reference-comparisons/r_132.png" alt="Ground truth and offline render comparison for test view r_132" loading="lazy" />
+                  </button>
+                  <figcaption>r_132 · 35.02 dB PSNR</figcaption>
+                </figure>
+                <figure class="reference-card is-comparison">
+                  <button
+                    class="reference-trigger"
+                    type="button"
+                    data-lightbox-src="./assets/reference-comparisons/r_165.png"
+                    data-lightbox-alt="Ground truth and offline render comparison for test view r_165"
+                    data-lightbox-title="r_165 · PSNR 36.15 dB"
+                    aria-label="Open comparison for test view r_165"
+                  >
+                    <img src="./assets/reference-comparisons/r_165.png" alt="Ground truth and offline render comparison for test view r_165" loading="lazy" />
+                  </button>
+                  <figcaption>r_165 · 36.15 dB PSNR</figcaption>
+                </figure>
+              </div>
             </div>
           </section>
-          <p class="build-time">Built: 2026-03-17 11:30 UTC</p>
+          <p class="build-time">Built: 2026-03-17 21:23 UTC</p>
         </div>
       </section>
       <section class="viewport">
