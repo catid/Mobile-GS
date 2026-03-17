@@ -664,8 +664,8 @@ export class WebGL2SplatRenderer {
     gl.uniform1f(this.netLoc.bOpacity, this.netLayout.bOpacity[0]);
     this._bindWeightTextures(this.netProgram);
 
-    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, this.netBuffer);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, this.transformFeedback);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, this.netBuffer);
     gl.enable(gl.RASTERIZER_DISCARD);
     gl.beginTransformFeedback(gl.POINTS);
     gl.drawArrays(gl.POINTS, 0, this.instanceCount);

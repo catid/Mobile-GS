@@ -3,6 +3,15 @@ import { splitOpacityPhiWeights } from "./opacity_phi.js";
 const GEOM_FLOATS = 11;
 const SH_FLOATS = 12;
 const SH_TEX_WIDTH = 2048;
+const INPUT_DIM = 22;
+const HIDDEN0 = 256;
+const HIDDEN1 = 128;
+const HIDDEN2 = 64;
+const B0_OFFSET = 0;
+const B1_OFFSET = B0_OFFSET + HIDDEN0;
+const B2_OFFSET = B1_OFFSET + HIDDEN1;
+const BPHI_OFFSET = B2_OFFSET + HIDDEN2;
+const BOPACITY_OFFSET = BPHI_OFFSET + 1;
 const UNIFORM_BUFFER_SIZE = 176;
 const WORKGROUP_SIZE = 64;
 
@@ -28,15 +37,11 @@ struct NetOutputBuffer {
 @group(0) @binding(2) var<storage, read> geom : ScalarBuffer;
 @group(0) @binding(3) var<storage, read_write> netOut : NetOutputBuffer;
 @group(0) @binding(4) var<storage, read> w0 : ScalarBuffer;
-@group(0) @binding(5) var<storage, read> b0 : ScalarBuffer;
-@group(0) @binding(6) var<storage, read> w1 : ScalarBuffer;
-@group(0) @binding(7) var<storage, read> b1 : ScalarBuffer;
-@group(0) @binding(8) var<storage, read> w2 : ScalarBuffer;
-@group(0) @binding(9) var<storage, read> b2 : ScalarBuffer;
-@group(0) @binding(10) var<storage, read> wPhi : ScalarBuffer;
-@group(0) @binding(11) var<storage, read> bPhi : ScalarBuffer;
-@group(0) @binding(12) var<storage, read> wOpacity : ScalarBuffer;
-@group(0) @binding(13) var<storage, read> bOpacity : ScalarBuffer;
+@group(0) @binding(5) var<storage, read> w1 : ScalarBuffer;
+@group(0) @binding(6) var<storage, read> w2 : ScalarBuffer;
+@group(0) @binding(7) var<storage, read> wPhi : ScalarBuffer;
+@group(0) @binding(8) var<storage, read> wOpacity : ScalarBuffer;
+@group(0) @binding(9) var<storage, read> biases : ScalarBuffer;
 
 fn getGeom(index : u32, component : u32) -> f32 {
   return geom.values[index * 11u + component];
@@ -58,7 +63,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let sh1 = getSHTexel(index, 1u);
   let sh2 = getSHTexel(index, 2u);
 
-  var input : array<f32, 24>;
+  var input : array<f32, ${INPUT_DIM}>;
   input[0] = sh0.x;
   input[1] = sh0.y;
   input[2] = sh0.z;
@@ -100,36 +105,36 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   input[22] = 0.0;
   input[23] = 0.0;
 
-  var layer0 : array<f32, 256>;
-  for (var row = 0u; row < 256u; row = row + 1u) {
-    var sum = b0.values[row];
-    for (var col = 0u; col < 22u; col = col + 1u) {
-      sum = sum + w0.values[row * 22u + col] * input[col];
+  var layer0 : array<f32, ${HIDDEN0}>;
+  for (var row = 0u; row < ${HIDDEN0}u; row = row + 1u) {
+    var sum = biases.values[${B0_OFFSET}u + row];
+    for (var col = 0u; col < ${INPUT_DIM}u; col = col + 1u) {
+      sum = sum + w0.values[row * ${INPUT_DIM}u + col] * input[col];
     }
     layer0[row] = max(sum, 0.0);
   }
 
-  var layer1 : array<f32, 128>;
-  for (var row = 0u; row < 128u; row = row + 1u) {
-    var sum = b1.values[row];
-    for (var col = 0u; col < 256u; col = col + 1u) {
-      sum = sum + w1.values[row * 256u + col] * layer0[col];
+  var layer1 : array<f32, ${HIDDEN1}>;
+  for (var row = 0u; row < ${HIDDEN1}u; row = row + 1u) {
+    var sum = biases.values[${B1_OFFSET}u + row];
+    for (var col = 0u; col < ${HIDDEN0}u; col = col + 1u) {
+      sum = sum + w1.values[row * ${HIDDEN0}u + col] * layer0[col];
     }
     layer1[row] = max(sum, 0.0);
   }
 
-  var layer2 : array<f32, 64>;
-  for (var row = 0u; row < 64u; row = row + 1u) {
-    var sum = b2.values[row];
-    for (var col = 0u; col < 128u; col = col + 1u) {
-      sum = sum + w2.values[row * 128u + col] * layer1[col];
+  var layer2 : array<f32, ${HIDDEN2}>;
+  for (var row = 0u; row < ${HIDDEN2}u; row = row + 1u) {
+    var sum = biases.values[${B2_OFFSET}u + row];
+    for (var col = 0u; col < ${HIDDEN1}u; col = col + 1u) {
+      sum = sum + w2.values[row * ${HIDDEN1}u + col] * layer1[col];
     }
     layer2[row] = max(sum, 0.0);
   }
 
-  var phiValue = bPhi.values[0];
-  var opacityValue = bOpacity.values[0];
-  for (var col = 0u; col < 64u; col = col + 1u) {
+  var phiValue = biases.values[${BPHI_OFFSET}u];
+  var opacityValue = biases.values[${BOPACITY_OFFSET}u];
+  for (var col = 0u; col < ${HIDDEN2}u; col = col + 1u) {
     phiValue = phiValue + wPhi.values[col] * layer2[col];
     opacityValue = opacityValue + wOpacity.values[col] * layer2[col];
   }
@@ -378,6 +383,12 @@ export class WebGPUSplatRenderer {
     this._accumWidth = 0;
     this._accumHeight = 0;
     this.netLayout = splitOpacityPhiWeights(scene.opacityPhiWeights, scene.opacityPhi);
+    if (this.netLayout.inputDim !== INPUT_DIM ||
+        this.netLayout.hiddenDims[0] !== HIDDEN0 ||
+        this.netLayout.hiddenDims[1] !== HIDDEN1 ||
+        this.netLayout.hiddenDims[2] !== HIDDEN2) {
+      throw new Error("Unsupported opacity_phi network shape for WebGPU renderer");
+    }
   }
 
   async initialize() {
@@ -402,15 +413,17 @@ export class WebGPUSplatRenderer {
     });
 
     this.w0Buffer = createStorageBuffer(device, this.netLayout.w0);
-    this.b0Buffer = createStorageBuffer(device, this.netLayout.b0);
     this.w1Buffer = createStorageBuffer(device, this.netLayout.w1);
-    this.b1Buffer = createStorageBuffer(device, this.netLayout.b1);
     this.w2Buffer = createStorageBuffer(device, this.netLayout.w2);
-    this.b2Buffer = createStorageBuffer(device, this.netLayout.b2);
     this.wPhiBuffer = createStorageBuffer(device, this.netLayout.wPhi);
-    this.bPhiBuffer = createStorageBuffer(device, this.netLayout.bPhi);
     this.wOpacityBuffer = createStorageBuffer(device, this.netLayout.wOpacity);
-    this.bOpacityBuffer = createStorageBuffer(device, this.netLayout.bOpacity);
+    const biasData = new Float32Array(BOPACITY_OFFSET + 1);
+    biasData.set(this.netLayout.b0, B0_OFFSET);
+    biasData.set(this.netLayout.b1, B1_OFFSET);
+    biasData.set(this.netLayout.b2, B2_OFFSET);
+    biasData.set(this.netLayout.bPhi, BPHI_OFFSET);
+    biasData.set(this.netLayout.bOpacity, BOPACITY_OFFSET);
+    this.biasBuffer = createStorageBuffer(device, biasData);
 
     const netShader = device.createShaderModule({ code: WGSL_NET });
     const splatShader = device.createShaderModule({ code: WGSL_SPLAT });
@@ -428,10 +441,6 @@ export class WebGPUSplatRenderer {
         { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     });
 
@@ -551,15 +560,11 @@ export class WebGPUSplatRenderer {
         { binding: 2, resource: { buffer: this.instanceBuffer } },
         { binding: 3, resource: { buffer: this.netOutBuffer } },
         { binding: 4, resource: { buffer: this.w0Buffer } },
-        { binding: 5, resource: { buffer: this.b0Buffer } },
-        { binding: 6, resource: { buffer: this.w1Buffer } },
-        { binding: 7, resource: { buffer: this.b1Buffer } },
-        { binding: 8, resource: { buffer: this.w2Buffer } },
-        { binding: 9, resource: { buffer: this.b2Buffer } },
-        { binding: 10, resource: { buffer: this.wPhiBuffer } },
-        { binding: 11, resource: { buffer: this.bPhiBuffer } },
-        { binding: 12, resource: { buffer: this.wOpacityBuffer } },
-        { binding: 13, resource: { buffer: this.bOpacityBuffer } },
+        { binding: 5, resource: { buffer: this.w1Buffer } },
+        { binding: 6, resource: { buffer: this.w2Buffer } },
+        { binding: 7, resource: { buffer: this.wPhiBuffer } },
+        { binding: 8, resource: { buffer: this.wOpacityBuffer } },
+        { binding: 9, resource: { buffer: this.biasBuffer } },
       ],
     });
 
