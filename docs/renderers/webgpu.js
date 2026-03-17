@@ -324,7 +324,7 @@ export class WebGPUSplatRenderer {
     // ── Compose program ─────────────────────────────────────────────────
     const composeShader = device.createShaderModule({ code: WGSL_COMPOSE });
 
-    const bg = scene.render.backgroundTop;
+    const bg = this.scene.render.backgroundTop;
     this.bgBuffer = device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
