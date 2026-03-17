@@ -1,8 +1,8 @@
-// Mobile-GS two-pass WebGPU renderer — matches _ms CUDA blending formula (phi=0):
-//   Pass 1: MRT with two render targets
-//     target 0 (rgba16float): accumulate (color*alpha_w, alpha_w) additively
-//     target 1 (r16float):    accumulate log(1-alpha_clamped) additively
-//   Pass 2: compose
+// Mobile-GS three-pass WebGPU renderer — matches _ms CUDA blending formula (phi=0):
+//   Pass 1a: accumTexture (rgba16float): accumulate (color*alpha_w, alpha_w) additively
+//   Pass 1b: logTTexture  (rgba16float): accumulate log(1-alpha_clamped) additively
+//   Pass 2:  compose
+//   (Two separate passes instead of MRT — MRT for float targets is unreliable on some devices)
 //     w_fg     = accum.a
 //     C_fg     = accum.rgb / w_fg
 //     T        = exp(logT_accum)  -- = prod(1-alpha_i), exact transmittance
@@ -49,10 +49,7 @@ struct VertexOutput {
   @location(3)       weight    : f32,         // exp(min(max_scale/depth, 20))
 };
 
-struct FragOut {
-  @location(0) accum : vec4<f32>,  // color*alpha_w, alpha_w (w_fg)
-  @location(1) logT  : vec4<f32>,  // .r = log(1-alpha) — negative, sums to log(T)
-};
+// Two separate fragment entry points (no MRT)
 
 const quad = array<vec2<f32>, 6>(
   vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
@@ -175,23 +172,29 @@ fn vsMain(
   return out;
 }
 
-@fragment
-fn fsMain(in: VertexOutput) -> FragOut {
-  // WebGPU @builtin(position).y is y-from-top, but the conic cross-term was derived
-  // with J1.y positive (y-from-bottom convention).  Negate dy to match.
+fn splatAlpha(in: VertexOutput) -> f32 {
+  // WebGPU @builtin(position).y is y-from-top; negate dy to match conic convention.
   let d = vec2<f32>(in.position.x - in.centerPix.x, in.centerPix.y - in.position.y);
   let power = 0.5*(in.conic.x*d.x*d.x + 2.0*in.conic.y*d.x*d.y + in.conic.z*d.y*d.y);
-  if (power > 8.0) { discard; }
-  // alpha clamped at 0.99 as in the CUDA kernel — affects both T and w_fg
-  let alpha = min(0.99, in.color.a * exp(-power) * camera.params.x);
+  if (power > 8.0) { return -1.0; }  // sentinel: discard
+  return min(0.99, in.color.a * exp(-power) * camera.params.x);
+}
+
+// Pass 1a: accumulate (color*alpha_w, alpha_w) into accum target
+@fragment
+fn fsAccum(in: VertexOutput) -> @location(0) vec4<f32> {
+  let alpha = splatAlpha(in);
   let alpha_w = alpha * in.weight;
   if (alpha_w < 0.00001) { discard; }
-  var out: FragOut;
-  // target 0: color accumulation (with weight) and w_fg
-  out.accum = vec4<f32>(in.color.rgb * alpha_w, alpha_w);
-  // target 1: log-transmittance (weight-independent, as in CUDA T = prod(1-alpha))
-  out.logT  = vec4<f32>(log(1.0 - alpha), 0.0, 0.0, 0.0);
-  return out;
+  return vec4<f32>(in.color.rgb * alpha_w, alpha_w);
+}
+
+// Pass 1b: accumulate log(1-alpha) into logT target (separate pass — no MRT needed)
+@fragment
+fn fsLogT(in: VertexOutput) -> @location(0) vec4<f32> {
+  let alpha = splatAlpha(in);
+  if (alpha * in.weight < 0.00001) { discard; }
+  return vec4<f32>(log(1.0 - alpha), 0.0, 0.0, 0.0);
 }
 `;
 
@@ -258,7 +261,6 @@ export class WebGPUSplatRenderer {
     this.renderOptions = { alphaScale: scene.render.alphaScale };
     this._accumWidth  = 0;
     this._accumHeight = 0;
-    this._diagDone    = false;
   }
 
   async initialize() {
@@ -287,39 +289,40 @@ export class WebGPUSplatRenderer {
       ],
     });
 
-    this.splatPipeline = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [this.splatBGL] }),
-      vertex: {
-        module: splatShader, entryPoint: "vsMain",
-        buffers: [{
-          arrayStride: 44, stepMode: "instance",  // v5: 11 floats = 44 bytes
-          attributes: [
-            { shaderLocation: 0, offset:  0, format: "float32x4" },  // pos+opacity
-            { shaderLocation: 1, offset: 16, format: "float32x4" },  // quat
-            { shaderLocation: 2, offset: 32, format: "float32x3" },  // scale only
-          ],
-        }],
-      },
-      fragment: {
-        module: splatShader, entryPoint: "fsMain",
-        targets: [
-          {
-            format: "rgba16float",
-            blend: {
-              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
-              alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
-            },
-          },
-          {
-            // log-transmittance: accumulate log(1-alpha) additively into .r channel
-            // rgba16float used (not r16float) to guarantee blend support on all platforms
-            format: "rgba16float",
-            blend: {
-              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
-              alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
-            },
-          },
+    const addBlend = {
+      color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+      alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+    };
+    const splatVtx = {
+      buffers: [{
+        arrayStride: 44, stepMode: "instance",
+        attributes: [
+          { shaderLocation: 0, offset:  0, format: "float32x4" },
+          { shaderLocation: 1, offset: 16, format: "float32x4" },
+          { shaderLocation: 2, offset: 32, format: "float32x3" },
         ],
+      }],
+    };
+    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.splatBGL] });
+
+    // Pass 1a: accumulate (color*alpha_w, alpha_w) — single target
+    this.splatPipeline = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: { module: splatShader, entryPoint: "vsMain", ...splatVtx },
+      fragment: {
+        module: splatShader, entryPoint: "fsAccum",
+        targets: [{ format: "rgba16float", blend: addBlend }],
+      },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+    });
+
+    // Pass 1b: accumulate log(1-alpha) — single target, separate pass (no MRT)
+    this.logTPipeline = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: { module: splatShader, entryPoint: "vsMain", ...splatVtx },
+      fragment: {
+        module: splatShader, entryPoint: "fsLogT",
+        targets: [{ format: "rgba16float", blend: addBlend }],
       },
       primitive: { topology: "triangle-list", cullMode: "none" },
     });
@@ -468,28 +471,35 @@ export class WebGPUSplatRenderer {
 
     const encoder = device.createCommandEncoder();
 
-    // ── Pass 1: accumulate splats (MRT) ──────────────────────────────────
+    // ── Pass 1a: accumulate (color*alpha_w, alpha_w) into accumTexture ───
     const accumPass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: this.accumView,
-          clearValue: { r: 0, g: 0, b: 0, a: 0 },
-          loadOp: "clear",
-          storeOp: "store",
-        },
-        {
-          view: this.logTView,
-          clearValue: { r: 0, g: 0, b: 0, a: 0 },  // clear to 0 → T=exp(0)=1
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
+      colorAttachments: [{
+        view: this.accumView,
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: "clear",
+        storeOp: "store",
+      }],
     });
     accumPass.setPipeline(this.splatPipeline);
     accumPass.setBindGroup(0, this.splatBindGroup);
     accumPass.setVertexBuffer(0, this.instanceBuffer);
     accumPass.draw(6, this.instanceCount);
     accumPass.end();
+
+    // ── Pass 1b: accumulate log(1-alpha) into logTTexture ────────────────
+    const logTPass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.logTView,
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: "clear",
+        storeOp: "store",
+      }],
+    });
+    logTPass.setPipeline(this.logTPipeline);
+    logTPass.setBindGroup(0, this.splatBindGroup);
+    logTPass.setVertexBuffer(0, this.instanceBuffer);
+    logTPass.draw(6, this.instanceCount);
+    logTPass.end();
 
     // ── Pass 2: compose to canvas ────────────────────────────────────────
     const composePass = encoder.beginRenderPass({
@@ -504,39 +514,6 @@ export class WebGPUSplatRenderer {
     composePass.setBindGroup(0, this.composeBindGroup);
     composePass.draw(3);
     composePass.end();
-
-    // ── Diagnostic: read center pixel from logT + accum (first frame only) ─
-    if (!this._diagDone && this.instanceCount > 0) {
-      this._diagDone = true;
-      const cx = W >> 1, cy = H >> 1;
-      const readBuf = device.createBuffer({
-        size: 256,  // bytesPerRow must be ≥256
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-      const diagEnc = device.createCommandEncoder();
-      // Copy 1 pixel from logT texture (rgba16float = 8 bytes/pixel, but bytesPerRow≥256)
-      diagEnc.copyTextureToBuffer(
-        { texture: this.logTTexture, origin: { x: cx, y: cy } },
-        { buffer: readBuf, bytesPerRow: 256 },
-        { width: 1, height: 1 },
-      );
-      device.queue.submit([diagEnc.finish()]);
-      readBuf.mapAsync(GPUMapMode.READ).then(() => {
-        const f16 = new Uint16Array(readBuf.getMappedRange());
-        // float16 to float32 conversion for the R channel
-        const u = f16[0];
-        const sign = (u >> 15) ? -1 : 1;
-        const exp  = (u >> 10) & 0x1f;
-        const mant = u & 0x3ff;
-        let val;
-        if (exp === 0)       val = sign * Math.pow(2, -14) * (mant / 1024);
-        else if (exp === 31) val = mant ? NaN : sign * Infinity;
-        else                 val = sign * Math.pow(2, exp - 15) * (1 + mant / 1024);
-        const T = Math.exp(val);
-        console.log(`[WebGPU diag] center logT.r=${val.toFixed(4)}, T=${T.toFixed(4)}, coverage=${(1-T).toFixed(4)}`);
-        readBuf.unmap();
-      });
-    }
 
     device.queue.submit([encoder.finish()]);
   }
