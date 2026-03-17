@@ -258,6 +258,7 @@ export class WebGPUSplatRenderer {
     this.renderOptions = { alphaScale: scene.render.alphaScale };
     this._accumWidth  = 0;
     this._accumHeight = 0;
+    this._diagDone    = false;
   }
 
   async initialize() {
@@ -503,6 +504,39 @@ export class WebGPUSplatRenderer {
     composePass.setBindGroup(0, this.composeBindGroup);
     composePass.draw(3);
     composePass.end();
+
+    // ── Diagnostic: read center pixel from logT + accum (first frame only) ─
+    if (!this._diagDone && this.instanceCount > 0) {
+      this._diagDone = true;
+      const cx = W >> 1, cy = H >> 1;
+      const readBuf = device.createBuffer({
+        size: 256,  // bytesPerRow must be ≥256
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      const diagEnc = device.createCommandEncoder();
+      // Copy 1 pixel from logT texture (rgba16float = 8 bytes/pixel, but bytesPerRow≥256)
+      diagEnc.copyTextureToBuffer(
+        { texture: this.logTTexture, origin: { x: cx, y: cy } },
+        { buffer: readBuf, bytesPerRow: 256 },
+        { width: 1, height: 1 },
+      );
+      device.queue.submit([diagEnc.finish()]);
+      readBuf.mapAsync(GPUMapMode.READ).then(() => {
+        const f16 = new Uint16Array(readBuf.getMappedRange());
+        // float16 to float32 conversion for the R channel
+        const u = f16[0];
+        const sign = (u >> 15) ? -1 : 1;
+        const exp  = (u >> 10) & 0x1f;
+        const mant = u & 0x3ff;
+        let val;
+        if (exp === 0)       val = sign * Math.pow(2, -14) * (mant / 1024);
+        else if (exp === 31) val = mant ? NaN : sign * Infinity;
+        else                 val = sign * Math.pow(2, exp - 15) * (1 + mant / 1024);
+        const T = Math.exp(val);
+        console.log(`[WebGPU diag] center logT.r=${val.toFixed(4)}, T=${T.toFixed(4)}, coverage=${(1-T).toFixed(4)}`);
+        readBuf.unmap();
+      });
+    }
 
     device.queue.submit([encoder.finish()]);
   }
