@@ -1,8 +1,8 @@
-// Mobile-GS two-pass renderer — matches the _ms CUDA blending formula (phi=0):
-//   Pass 1: MRT with two render targets
-//     target 0 (RGBA float): accumulate (color*alpha_w, alpha_w) additively
-//     target 1 (R float):    accumulate log(1-alpha_clamped) additively
-//   Pass 2: compose
+// Mobile-GS three-pass renderer — matches the _ms CUDA blending formula (phi=0):
+//   Pass 1a: accumFBO  (RGBA float): accumulate (color*alpha_w, alpha_w) additively
+//   Pass 1b: logTFBO   (RGBA float): accumulate log(1-alpha_clamped) additively
+//   Pass 2:  compose
+//   (Two separate FBOs instead of MRT — avoids Mac/mobile driver compatibility issues)
 //     T        = exp(logT_accum)  -- = prod(1-alpha_i), exact transmittance
 //     coverage = 1 - T            -- matches CUDA formula exactly
 //   alpha = min(0.99, opacity * exp(-power) * alphaScale)  -- clamped as in CUDA
@@ -117,6 +117,7 @@ void main() {
 }
 `;
 
+// Pass 1a: color + w_fg accumulation
 const SPLAT_FRAG = `#version 300 es
 precision highp float;
 
@@ -127,19 +128,38 @@ in float vWeight;
 
 uniform float uAlphaScale;
 
-layout(location = 0) out vec4 outAccum;  // rgb = color * alpha_w,  a = alpha_w (w_fg)
-layout(location = 1) out vec4 outLogT;   // .r = log(1 - alpha_clamped) — negative, sums to log(T)
+out vec4 outAccum;  // rgb = color * alpha_w,  a = alpha_w (w_fg)
 
 void main() {
   vec2 d = gl_FragCoord.xy - vCenterPix;
   float power = 0.5*(vConic.x*d.x*d.x + 2.0*vConic.y*d.x*d.y + vConic.z*d.y*d.y);
   if (power > 8.0) discard;
-  // alpha clamped at 0.99 as in CUDA kernel — affects both T and w_fg
   float alpha = min(0.99, vColor.a * exp(-power) * uAlphaScale);
   float alpha_w = alpha * vWeight;
   if (alpha_w < 0.00001) discard;
   outAccum = vec4(vColor.rgb * alpha_w, alpha_w);
-  // log-transmittance: weight-independent, matches CUDA T = prod(1-alpha)
+}
+`;
+
+// Pass 1b: log-transmittance accumulation (separate pass — avoids MRT compatibility issues)
+const LOGT_FRAG = `#version 300 es
+precision highp float;
+
+in vec3 vConic;
+in vec2 vCenterPix;
+in vec4 vColor;  // .a = opacity
+in float vWeight;
+
+uniform float uAlphaScale;
+
+out vec4 outLogT;  // .r = log(1 - alpha), sums to log(T) = log(prod(1 - alpha_i))
+
+void main() {
+  vec2 d = gl_FragCoord.xy - vCenterPix;
+  float power = 0.5*(vConic.x*d.x*d.x + 2.0*vConic.y*d.x*d.y + vConic.z*d.y*d.y);
+  if (power > 8.0) discard;
+  float alpha = min(0.99, vColor.a * exp(-power) * uAlphaScale);
+  if (alpha * vWeight < 0.00001) discard;
   outLogT = vec4(log(1.0 - alpha), 0.0, 0.0, 0.0);
 }
 `;
@@ -247,6 +267,7 @@ export class WebGL2SplatRenderer {
 
     // Splat accumulation program
     this.splatProgram   = linkProgram(gl, SPLAT_VERT, SPLAT_FRAG);
+    this.logTProgram    = linkProgram(gl, SPLAT_VERT, LOGT_FRAG);
     this.composeProgram = linkProgram(gl, COMPOSE_VERT, COMPOSE_FRAG);
 
     // Splat program uniform locations
@@ -258,6 +279,18 @@ export class WebGL2SplatRenderer {
       height:     gl.getUniformLocation(this.splatProgram, "uHeight"),
       eye:        gl.getUniformLocation(this.splatProgram, "uEye"),
       alphaScale: gl.getUniformLocation(this.splatProgram, "uAlphaScale"),
+      shData:     null,  // set in initSHData
+    };
+
+    // LogT program uniform locations (same vertex shader, different fragment)
+    this.logTLoc = {
+      viewProj:   gl.getUniformLocation(this.logTProgram, "uViewProj"),
+      view:       gl.getUniformLocation(this.logTProgram, "uView"),
+      focal:      gl.getUniformLocation(this.logTProgram, "uFocal"),
+      width:      gl.getUniformLocation(this.logTProgram, "uWidth"),
+      height:     gl.getUniformLocation(this.logTProgram, "uHeight"),
+      eye:        gl.getUniformLocation(this.logTProgram, "uEye"),
+      alphaScale: gl.getUniformLocation(this.logTProgram, "uAlphaScale"),
       shData:     null,  // set in initSHData
     };
 
@@ -287,8 +320,9 @@ export class WebGL2SplatRenderer {
     gl.vertexAttribDivisor(2, 1);
     gl.bindVertexArray(null);
 
-    // Accumulation FBO (created on first resize)
+    // Two separate FBOs (no MRT — avoids Mac/mobile driver issues)
     this.accumFBO     = gl.createFramebuffer();
+    this.logTFBO      = gl.createFramebuffer();
     this.accumTexture = gl.createTexture();
     this.logTTexture  = gl.createTexture();
 
@@ -316,11 +350,15 @@ export class WebGL2SplatRenderer {
     setupTex(this.accumTexture, this._floatFmt, gl.RGBA, this._floatType);
     setupTex(this.logTTexture,  this._r1Fmt,   gl.RGBA, this._r1Type);
 
+    // Separate FBOs — no MRT
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
                             gl.TEXTURE_2D, this.accumTexture, 0);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1,
-                            gl.TEXTURE_2D, this.logTTexture,  0);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.logTFBO);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                            gl.TEXTURE_2D, this.logTTexture, 0);
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
@@ -354,6 +392,7 @@ export class WebGL2SplatRenderer {
                   gl.RGBA, gl.HALF_FLOAT, texData);
     gl.bindTexture(gl.TEXTURE_2D, null);
     this.splatLoc.shData = gl.getUniformLocation(this.splatProgram, "uSHData");
+    this.logTLoc.shData  = gl.getUniformLocation(this.logTProgram,  "uSHData");
   }
 
   updateGeometryData(geomData) {
@@ -378,12 +417,18 @@ export class WebGL2SplatRenderer {
     const H  = this.canvas.height;
     this._ensureFBO(W, H);
 
-    // ── Pass 1: accumulate splats into float FBO (MRT) ───────────────────
+    const bindSH = (loc) => {
+      if (this.shTexture && loc.shData !== null) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this.shTexture);
+        gl.uniform1i(loc.shData, 1);
+      }
+    };
+
+    // ── Pass 1a: accumulate (color*alpha_w, alpha_w) into accumFBO ────────
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
-    // Enable both color attachments: accum + logT
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.viewport(0, 0, W, H);
-    gl.clearColor(0, 0, 0, 0);  // logT cleared to 0 → T=exp(0)=1 (fully transparent)
+    gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
@@ -391,7 +436,6 @@ export class WebGL2SplatRenderer {
 
     gl.useProgram(this.splatProgram);
     gl.bindVertexArray(this.vao);
-
     gl.uniformMatrix4fv(this.splatLoc.viewProj, false, cameraState.viewProjection);
     gl.uniformMatrix4fv(this.splatLoc.view,     false, cameraState.view);
     gl.uniform1f(this.splatLoc.focal,      cameraState.focal);
@@ -399,14 +443,29 @@ export class WebGL2SplatRenderer {
     gl.uniform1f(this.splatLoc.height,     H);
     gl.uniform3fv(this.splatLoc.eye,       cameraState.eye);
     gl.uniform1f(this.splatLoc.alphaScale, this.renderOptions.alphaScale);
-
-    if (this.shTexture && this.splatLoc.shData !== null) {
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, this.shTexture);
-      gl.uniform1i(this.splatLoc.shData, 1);
-    }
-
+    bindSH(this.splatLoc);
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
+
+    // ── Pass 1b: accumulate log(1-alpha) into logTFBO ────────────────────
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.logTFBO);
+    gl.viewport(0, 0, W, H);
+    gl.clearColor(0, 0, 0, 0);  // cleared to 0 → T=exp(0)=1 (fully transparent)
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    // additive blend: sum of log(1-alpha_i) = log(prod(1-alpha_i)) = log(T)
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+
+    gl.useProgram(this.logTProgram);
+    gl.uniformMatrix4fv(this.logTLoc.viewProj, false, cameraState.viewProjection);
+    gl.uniformMatrix4fv(this.logTLoc.view,     false, cameraState.view);
+    gl.uniform1f(this.logTLoc.focal,      cameraState.focal);
+    gl.uniform1f(this.logTLoc.width,      W);
+    gl.uniform1f(this.logTLoc.height,     H);
+    gl.uniform3fv(this.logTLoc.eye,       cameraState.eye);
+    gl.uniform1f(this.logTLoc.alphaScale, this.renderOptions.alphaScale);
+    bindSH(this.logTLoc);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
+
     gl.bindVertexArray(null);
 
     // ── Pass 2: compose with background ──────────────────────────────────
