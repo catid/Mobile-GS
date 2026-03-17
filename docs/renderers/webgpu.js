@@ -266,8 +266,8 @@ fn vsMain(
 
   out.position = vec4<f32>(
     (cx + local.x * radius) / camera.viewport.x * 2.0 - 1.0,
-    1.0 - (cy + local.y * radius) / camera.viewport.y * 2.0,
-    clip.z * invW,
+    (cy + local.y * radius) / camera.viewport.y * 2.0 - 1.0,
+    clip.z * invW * 0.5 + 0.5,
     1.0
   );
   out.conic = conic;
@@ -279,8 +279,8 @@ fn vsMain(
   return out;
 }
 
-fn splatAlpha(in : VertexOutput) -> f32 {
-  let d = vec2<f32>(in.position.x - in.centerPix.x, in.centerPix.y - in.position.y);
+fn splatAlpha(in : VertexOutput, fragCoord : vec2<f32>) -> f32 {
+  let d = fragCoord - in.centerPix;
   let power = 0.5 * (in.conic.x * d.x * d.x + 2.0 * in.conic.y * d.x * d.y + in.conic.z * d.y * d.y);
   if (power > 8.0) {
     return -1.0;
@@ -289,8 +289,9 @@ fn splatAlpha(in : VertexOutput) -> f32 {
 }
 
 @fragment
-fn fsAccum(in : VertexOutput) -> @location(0) vec4<f32> {
-  let alpha = splatAlpha(in);
+fn fsAccum(in : VertexOutput, @builtin(position) fragPos : vec4<f32>) -> @location(0) vec4<f32> {
+  let fragCoord = vec2<f32>(fragPos.x, camera.viewport.y - fragPos.y);
+  let alpha = splatAlpha(in, fragCoord);
   let alphaWeight = alpha * in.weight;
   if (alphaWeight < 0.00001) {
     discard;
@@ -299,8 +300,9 @@ fn fsAccum(in : VertexOutput) -> @location(0) vec4<f32> {
 }
 
 @fragment
-fn fsLogT(in : VertexOutput) -> @location(0) vec4<f32> {
-  let alpha = splatAlpha(in);
+fn fsLogT(in : VertexOutput, @builtin(position) fragPos : vec4<f32>) -> @location(0) vec4<f32> {
+  let fragCoord = vec2<f32>(fragPos.x, camera.viewport.y - fragPos.y);
+  let alpha = splatAlpha(in, fragCoord);
   if (alpha < 0.00001) {
     discard;
   }
