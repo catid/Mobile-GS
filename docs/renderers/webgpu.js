@@ -166,6 +166,11 @@ struct VertexOutput {
   @location(3) weight : f32,
 };
 
+struct SplatOutputs {
+  @location(0) accum : vec4<f32>,
+  @location(1) logT : vec4<f32>,
+};
+
 const quad = array<vec2<f32>, 6>(
   vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
   vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
@@ -289,24 +294,21 @@ fn splatAlpha(in : VertexOutput, fragCoord : vec2<f32>) -> f32 {
 }
 
 @fragment
-fn fsAccum(in : VertexOutput) -> @location(0) vec4<f32> {
-  let fragCoord = vec2<f32>(in.position.x, camera.viewport.y - in.position.y);
-  let alpha = splatAlpha(in, fragCoord);
-  let alphaWeight = alpha * in.weight;
-  if (alphaWeight < 0.00001) {
-    discard;
-  }
-  return vec4<f32>(in.color.rgb * alphaWeight, alphaWeight);
-}
-
-@fragment
-fn fsLogT(in : VertexOutput) -> @location(0) vec4<f32> {
+fn fsSplat(in : VertexOutput) -> SplatOutputs {
   let fragCoord = vec2<f32>(in.position.x, camera.viewport.y - in.position.y);
   let alpha = splatAlpha(in, fragCoord);
   if (alpha < 0.00001) {
     discard;
   }
-  return vec4<f32>(log(1.0 - alpha), 0.0, 0.0, 0.0);
+  let alphaWeight = alpha * in.weight;
+  var out : SplatOutputs;
+  if (alphaWeight >= 0.00001) {
+    out.accum = vec4<f32>(in.color.rgb * alphaWeight, alphaWeight);
+  } else {
+    out.accum = vec4<f32>(0.0);
+  }
+  out.logT = vec4<f32>(log(1.0 - alpha), 0.0, 0.0, 0.0);
+  return out;
 }
 `;
 
@@ -379,9 +381,12 @@ export class WebGPUSplatRenderer {
     this.accumFormat = supportsFloat32Blend ? "rgba32float" : "rgba16float";
     this.logTFormat = supportsFloat32Blend ? "rgba32float" : "rgba16float";
     this.renderOptions = { alphaScale: scene.render.alphaScale };
+    this.uniformData = new Float32Array(44);
     this.instanceCount = 0;
     this._accumWidth = 0;
     this._accumHeight = 0;
+    this._netDirty = true;
+    this._lastNetEye = new Float32Array([Number.NaN, Number.NaN, Number.NaN]);
     this.netLayout = splitOpacityPhiWeights(scene.opacityPhiWeights, scene.opacityPhi);
     if (this.netLayout.inputDim !== INPUT_DIM ||
         this.netLayout.hiddenDims[0] !== HIDDEN0 ||
@@ -483,24 +488,16 @@ export class WebGPUSplatRenderer {
       alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
     };
 
-    this.accumPipeline = device.createRenderPipeline({
+    this.splatPipeline = device.createRenderPipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.splatBindGroupLayout] }),
       vertex: vertexState,
       fragment: {
         module: splatShader,
-        entryPoint: "fsAccum",
-        targets: [{ format: this.accumFormat, blend: additiveBlend }],
-      },
-      primitive: { topology: "triangle-list", cullMode: "none" },
-    });
-
-    this.logTPipeline = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [this.splatBindGroupLayout] }),
-      vertex: vertexState,
-      fragment: {
-        module: splatShader,
-        entryPoint: "fsLogT",
-        targets: [{ format: this.logTFormat, blend: additiveBlend }],
+        entryPoint: "fsSplat",
+        targets: [
+          { format: this.accumFormat, blend: additiveBlend },
+          { format: this.logTFormat, blend: additiveBlend },
+        ],
       },
       primitive: { topology: "triangle-list", cullMode: "none" },
     });
@@ -614,6 +611,7 @@ export class WebGPUSplatRenderer {
     }
     this.device.queue.writeBuffer(this.instanceBuffer, 0, geomData.buffer, geomData.byteOffset, geomData.byteLength);
     this.instanceCount = geomData.length / GEOM_FLOATS;
+    this._netDirty = true;
 
     const netBytes = this.instanceCount * 8;
     if (this.netOutBuffer.size !== netBytes) {
@@ -637,7 +635,8 @@ export class WebGPUSplatRenderer {
   render(cameraState) {
     if (!this.netBindGroup || !this.splatBindGroup || !this.context) return;
 
-    const packed = new Float32Array(44);
+    const packed = this.uniformData;
+    packed.fill(0);
     packed.set(cameraState.viewProjection, 0);
     packed.set(cameraState.view, 16);
     packed[32] = this.canvas.width;
@@ -650,40 +649,44 @@ export class WebGPUSplatRenderer {
     this.device.queue.writeBuffer(this.uniformBuffer, 0, packed);
 
     const encoder = this.device.createCommandEncoder();
+    const eye = cameraState.eye;
+    const needsNetPass = this._netDirty ||
+      eye[0] !== this._lastNetEye[0] ||
+      eye[1] !== this._lastNetEye[1] ||
+      eye[2] !== this._lastNetEye[2];
+    if (needsNetPass) {
+      const computePass = encoder.beginComputePass();
+      computePass.setPipeline(this.netPipeline);
+      computePass.setBindGroup(0, this.netBindGroup);
+      computePass.dispatchWorkgroups(Math.ceil(this.instanceCount / WORKGROUP_SIZE));
+      computePass.end();
+      this._lastNetEye[0] = eye[0];
+      this._lastNetEye[1] = eye[1];
+      this._lastNetEye[2] = eye[2];
+      this._netDirty = false;
+    }
 
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(this.netPipeline);
-    computePass.setBindGroup(0, this.netBindGroup);
-    computePass.dispatchWorkgroups(Math.ceil(this.instanceCount / WORKGROUP_SIZE));
-    computePass.end();
-
-    const accumPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: this.accumView,
-        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
+    const splatPass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: this.accumView,
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: "clear",
+          storeOp: "store",
+        },
+        {
+          view: this.logTView,
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: "clear",
+          storeOp: "store",
+        },
+      ],
     });
-    accumPass.setPipeline(this.accumPipeline);
-    accumPass.setBindGroup(0, this.splatBindGroup);
-    accumPass.setVertexBuffer(0, this.instanceBuffer);
-    accumPass.draw(6, this.instanceCount);
-    accumPass.end();
-
-    const logTPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: this.logTView,
-        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-    });
-    logTPass.setPipeline(this.logTPipeline);
-    logTPass.setBindGroup(0, this.splatBindGroup);
-    logTPass.setVertexBuffer(0, this.instanceBuffer);
-    logTPass.draw(6, this.instanceCount);
-    logTPass.end();
+    splatPass.setPipeline(this.splatPipeline);
+    splatPass.setBindGroup(0, this.splatBindGroup);
+    splatPass.setVertexBuffer(0, this.instanceBuffer);
+    splatPass.draw(6, this.instanceCount);
+    splatPass.end();
 
     const composePass = encoder.beginRenderPass({
       colorAttachments: [{
